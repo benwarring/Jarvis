@@ -1,0 +1,38 @@
+# Secrets — nothing here ever gets committed
+.env
+.env.*
+!.env.example
+secrets/
+*.json.key
+token.json
+credentials.json
+gcal-service-account.json
+plan/
+
+# Local state
+jarvis.db
+jarvis.db-journal
+*.sqlite3
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Logs
+*.log
+logs/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
