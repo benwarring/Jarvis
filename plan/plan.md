@@ -332,7 +332,12 @@ empty and Layer 1 never fires.
 
 **Weather — TBD**, pending the provider decision in §14.
 
-**Everything is allowlisted to one Discord user ID.** Jarvis touches a real
+**Everything is allowlisted to one person's Discord user IDs.** `DISCORD_OWNER_USER_ID1`
+is required and `DISCORD_OWNER_USER_ID2` is optional, so one human running two accounts
+gets both without the system becoming multi-user — the allowlist is a set, and every
+command path tests membership through the single `is_owner` in `bot/client.py`. A
+confirmation is still answered by the account that requested it, so a `/event` started
+on one account cannot be confirmed from the other. Jarvis touches a real
 calendar; a bot that takes commands from anyone in the guild is a bad idea even in
 a guild of one.
 
@@ -451,7 +456,9 @@ zero API cost is already worth having on your phone.
 
 ## 13. Explicit non-goals (for now)
 
-- Multi-user support. One allowlisted user, assumed throughout.
+- Multi-user support. One allowlisted *person* throughout — who may hold more than one
+  Discord account (§7). There is still no per-user data, no separate calendars, and no
+  notion of "whose" a task is.
 - Email. Deliberately out of scope — it multiplies the auth and privacy surface.
 - Rescheduling or moving existing calendar events (read + create only through Phase 6).
 - Recurring event creation.

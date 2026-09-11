@@ -23,7 +23,8 @@ from Jarvis.storage import db  # noqa: E402
 FAKE_ENV = {
     "DISCORD_BOT_TOKEN": "fake-token",
     "DISCORD_GUILD_ID": "1",
-    "DISCORD_OWNER_USER_ID": "424242",
+    "DISCORD_OWNER_USER_ID1": "424242",
+    "DISCORD_OWNER_USER_ID2": "515151",
     "DISCORD_INBOX_CHANNEL_ID": "10",
     "DISCORD_BRIEF_CHANNEL_ID": "20",
     "DISCORD_GROCERY_CHANNEL_ID": "30",
@@ -38,7 +39,8 @@ FAKE_ENV = {
     "TIMEZONE": "America/New_York",
 }
 
-OWNER_ID = int(FAKE_ENV["DISCORD_OWNER_USER_ID"])
+OWNER_ID = int(FAKE_ENV["DISCORD_OWNER_USER_ID1"])
+SECOND_OWNER_ID = int(FAKE_ENV["DISCORD_OWNER_USER_ID2"])
 
 
 @pytest.fixture(autouse=True)

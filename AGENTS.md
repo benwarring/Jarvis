@@ -41,6 +41,7 @@ The model ID is `OPENAI_MODEL` in `.env` — never a literal in code.
 
 - `.env` and `secrets/` are gitignored. Never read a credential into a log line, a
   Discord message, an error trace, or a test fixture.
-- Every command path checks the caller against `DISCORD_OWNER_USER_ID` before doing
+- Every command path checks the caller against the owner allowlist (`DISCORD_OWNER_USER_ID1`,
+  plus the optional `DISCORD_OWNER_USER_ID2`) before doing
   anything. This is not optional — Jarvis writes to a real calendar.
 - Calendar writes and multi-item batches require ✅ confirmation before executing.

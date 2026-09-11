@@ -13,7 +13,7 @@ log = get_logger(__name__)
 
 
 def is_owner(user_id: int) -> bool:
-    return user_id == get_config().discord_owner_user_id
+    return user_id in get_config().discord_owner_user_ids
 
 
 async def _owner_only(interaction: discord.Interaction) -> bool:

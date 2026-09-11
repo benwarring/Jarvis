@@ -25,7 +25,7 @@ from Jarvis.integrations import gcal
 from Jarvis.router.intents import Intent
 from Jarvis.storage.models import find_message
 
-from tests.conftest import OWNER_ID
+from tests.conftest import OWNER_ID, SECOND_OWNER_ID
 
 CHANNEL_ID = 999
 MESSAGE_ID = 555
@@ -343,8 +343,37 @@ def test_an_agenda_asked_in_plain_english_reads_and_replies(monkeypatch):
 
 def test_a_non_owner_message_is_ignored(monkeypatch, created):
     monkeypatch.setattr(gcal, "list_events", lambda day=None: [])
-    message = FakeMessage("what do i have today?", author_id=OWNER_ID + 1)
+    message = FakeMessage("what do i have today?", author_id=OWNER_ID + SECOND_OWNER_ID)
     asyncio.run(handlers.on_message(message))
 
     assert message.reactions == [] and message.replies == []
+
+
+def test_the_second_owner_account_works_too(monkeypatch):
+    """The allowlist holds two accounts for one human, and both reach the real path."""
+    monkeypatch.setattr(gcal, "list_events", lambda day=None: [])
+    message = FakeMessage("what do i have today?", author_id=SECOND_OWNER_ID)
+    asyncio.run(handlers.on_message(message))
+
+    assert message.reactions == [CHECK]
+    assert message.replies
+
+
+def test_the_second_owner_can_confirm_its_own_event(created):
+    """Each account confirms what it asked for; the requester check is per-account."""
+    channel = FakeChannel()
+    pend(requester_id=SECOND_OWNER_ID)
+    react(payload(channel, user_id=SECOND_OWNER_ID))
+
+    assert len(created) == 1
+
+
+def test_one_owner_account_cannot_confirm_the_others_prompt(created):
+    """Same human, but a confirmation is still answered by the account that asked."""
+    channel = FakeChannel()
+    pend(requester_id=SECOND_OWNER_ID)
+    react(payload(channel, user_id=OWNER_ID))
+
+    assert created == [], "the requester check still gates a second owner account"
+    assert MESSAGE_ID in handlers.PENDING, "and the prompt stays live for the right account"
 

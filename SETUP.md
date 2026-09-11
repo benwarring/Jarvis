@@ -26,7 +26,14 @@ the `.env` keys it produces.
 6. **Get the IDs** — enable *Settings -> Advanced -> Developer Mode*, then right-click
    each to *Copy ID*: the server, each channel, and **your own user account**.
 
-Produces: `DISCORD_BOT_TOKEN`, `DISCORD_GUILD_ID`, `DISCORD_OWNER_USER_ID`,
+   If you use Discord from more than one account, copy the ID of each. The first
+   goes in `DISCORD_OWNER_USER_ID1`, the second in `DISCORD_OWNER_USER_ID2`. Only
+   the first is required — a single-account setup needs no placeholder for the
+   second, and a typo in it fails at startup rather than silently locking that
+   account out.
+
+Produces: `DISCORD_BOT_TOKEN`, `DISCORD_GUILD_ID`, `DISCORD_OWNER_USER_ID1`,
+`DISCORD_OWNER_USER_ID2` (optional),
 `DISCORD_INBOX_CHANNEL_ID`, `DISCORD_BRIEF_CHANNEL_ID`,
 `DISCORD_GROCERY_CHANNEL_ID`, `DISCORD_LOG_CHANNEL_ID`
 

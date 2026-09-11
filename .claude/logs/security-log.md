@@ -437,3 +437,184 @@ impossible given the atomic dict operation. Recommend fixing the two LOW finding
 before Phase 9 (both are small, and the second one touches write *timing*, so it's
 worth closing before this flow sees real traffic) — but neither blocks shipping
 Phase 3/4 as reviewed.
+
+---
+
+## Owner allowlist — two accounts
+
+**Date:** 2026-09-09
+**Scope:** targeted, per the cycle brief — `Jarvis/config.py` (`discord_owner_user_id: int`
+→ `discord_owner_user_ids: frozenset[int]`, `_OWNER_KEYS`/`_OPTIONAL_INT_KEYS`, the second
+parsing loop), `Jarvis/bot/client.py` (`is_owner`), `tests/conftest.py`,
+`tests/unit/test_config.py`, `tests/unit/test_confirmation.py`, and the doc updates
+(`SETUP.md`, `plan/plan.md` §7/§13, `CLAUDE.md`, `AGENTS.md`). Method: full read of
+`config.py` end to end, hand-traced every parsing branch for the six adversarial inputs
+the brief named, grepped the whole tree for the old unsuffixed key name and the old
+singular field name, re-read `bot/client.py` and `bot/handlers.py` in full to re-verify
+`is_owner` is still the only gate and to re-trace the confirmation reaction path against
+two distinct owner IDs, read the new/changed tests to confirm they assert the behavior
+claimed rather than just exercising it, and ran `python -m pytest tests/ -q` (384 passed,
+matches the brief). Did not open `.env` or `secrets/`. No files edited under `Jarvis/` or
+`tests/`.
+
+### 1. Can the allowlist ever be empty or unintentionally permissive?
+
+Traced `get_config()` (`Jarvis/config.py:63-110`) against each case named in the brief:
+
+- **`DISCORD_OWNER_USER_ID2` unset, blank, or whitespace-only:** `os.getenv(key, "").strip()`
+  (line 71) normalizes all three to `""`. The optional-loop guard `if not value: continue`
+  (line 83-84) skips it — no entry added to `ints`, so the final
+  `frozenset(ints[k] for k in _OWNER_KEYS if k in ints)` (line 98) contains only ID1.
+  Fails safe: no error, no silent widening, matches the required-key's own behavior.
+- **Non-integer (`"me"`, `"abc"`):** `int(value)` raises `ValueError`, caught and appended
+  to `problems` as `"DISCORD_OWNER_USER_ID2 (not an integer)"` (line 85-88) →
+  `SystemExit` at startup, naming the key, never the value. Fails closed — the process
+  never reaches a state with a bad ID in the set. Covered by
+  `tests/unit/test_config.py:65-72`.
+- **Negative number or `0`:** `int("-5")` / `int("0")` both succeed and are added to
+  `ints`, so a negative or zero value *would* end up in the frozenset. This is not a
+  parsing bug — no widening occurs in practice, because no real Discord snowflake is
+  negative or `0` (`discord.py` snowflakes are always large positive integers), so an
+  entry like that can never match a real `interaction.user.id`/`payload.user_id` and is
+  inert. **This is pre-existing, not introduced by this change** — the same
+  no-range-check pattern already existed for the single required ID before this diff
+  (`_INT_KEYS`'s loop at line 75-81 has never validated sign or magnitude either); the
+  two-account change only extends an existing, already-inert gap to a second key. Not
+  worth fixing now (informational only), but noting it so it isn't rediscovered as "new."
+- **Duplicate of ID1:** if both keys resolve to the same integer, `frozenset(...)`
+  naturally de-duplicates (line 98) — one member, no error, no special-case code needed.
+  Confirmed by reading the comprehension; no test exercises this exact case but none is
+  needed, the frozenset's own semantics cover it.
+
+No path was found where a missing, blank, malformed, negative, zero, or duplicate
+`DISCORD_OWNER_USER_ID2` produces an allowlist wider than "ID1, and optionally ID2,
+exactly as configured." Every malformed-but-parseable-as-int case is inert by construction
+(no real user ID collides with it); every unparseable case crashes the process at startup
+rather than silently dropping or admitting anything. Clean.
+
+### 2. Does the rename leave a stale path?
+
+Grepped the whole tree for `DISCORD_OWNER_USER_ID` (unsuffixed) and `discord_owner_user_id`
+(old singular field name). The only hits are historical prose inside this same log file
+(Pass 1's `.claude/logs/security-log.md:29,142`, describing the *old* single-ID design as
+it stood at the time of that pass) — not code, not config, not a currently-read env key.
+No file under `Jarvis/` or `tests/` references either old name. `Jarvis/config.py:55`'s
+`_INT_KEYS` is built from `_REQUIRED`, which already contains only the new
+`DISCORD_OWNER_USER_ID1`; `_OWNER_KEYS` (line 59) uses only the two new suffixed names.
+Grepping `is_owner|owner_user_id|OWNER_USER_ID` across `Jarvis/` turned up exactly the
+expected six live call/definition sites (`config.py:17,43,59,98`, `bot/client.py:15-16,21`,
+`bot/handlers.py:11,92,128`) and nothing else. No dead code, no latent `AttributeError` or
+`KeyError`. Clean rename.
+
+### 3. Is `is_owner` still the single gate?
+
+Re-traced all three entry points in `bot/client.py` and `bot/handlers.py`:
+
+- **Slash commands:** `bot.tree.interaction_check = _owner_only` (`bot/client.py:62`),
+  unchanged from Pass 1/Cycle 2 — still a global tree-level check, still calls
+  `is_owner(interaction.user.id)` (`bot/client.py:21`), which now checks membership in
+  `discord_owner_user_ids` (`bot/client.py:16`) instead of `==` against a single int.
+- **`on_message`:** `bot/handlers.py:128` — `if message.author.bot or not
+  is_owner(message.author.id): return`. Same function, same call shape.
+- **`on_raw_reaction_add`:** `bot/handlers.py:92` — `if not is_owner(payload.user_id):`.
+  Same.
+
+Grepped for any direct comparison against a config field (`== get_config()`,
+`== cfg.discord_owner`, `!= .discord_owner`) anywhere in `Jarvis/` — none found outside
+`is_owner`'s own body. All three command paths route through the one function, and the
+one function is the only place `discord_owner_user_ids` is read for authorization. No
+bypass. Clean — matches the "single gate" finding from Pass 1, now re-verified against the
+set-membership form.
+
+### 4. Does the confirmation flow still hold, and is same-account confirmation the right call?
+
+Traced `confirm()` and `on_raw_reaction_add()` (`bot/handlers.py:50-124`) with two distinct
+owner IDs in mind. `PENDING[message.id] = (intent, interaction.user.id, monotonic())`
+(line 60) stores whichever owner account ran `/event` as `requester_id`, unconditionally
+(there's no branch there that treats "an owner" specially vs "the specific owner"). On
+reaction, `if payload.user_id != requester_id: return` (line 96-97) still compares against
+that exact ID, not against `discord_owner_user_ids` again. Net effect, confirmed against
+the new tests: **account A starts `/event`, only account A can confirm it** —
+`tests/unit/test_confirmation.py:362-368` (`test_the_second_owner_can_confirm_its_own_event`)
+and `:371-378` (`test_one_owner_account_cannot_confirm_the_others_prompt`) assert exactly
+this, and both pass. This is not an oversight; `plan/plan.md:339-340` states it as the
+intended design ("A confirmation is still answered by the account that requested it, so a
+`/event` started on one account cannot be confirmed from the other"), and the tests were
+written to lock that behavior in.
+
+**Ruling:** the same-account restriction is safe, but it buys effectively no additional
+security over "any owner account may confirm any pending owner-originated intent" — and
+I'd recommend the team treat that as an open question rather than settled, because the
+tradeoff cuts less clean than the plan's framing suggests:
+
+- Both IDs gate identically at every other command path (`is_owner` treats them as
+  interchangeable everywhere except this one check). An attacker who compromises account
+  B's session can already call `/event` and confirm its own prompt with account B alone —
+  the requester-match check does not shrink that blast radius, because the attacker never
+  needs account A to do anything. So as a defense against a compromised second account,
+  this check does nothing.
+- The one thing it *does* provide: it stops account A's confirmation from being
+  rubber-stamped by account B without account A's owner ever having intended it — i.e. it
+  keeps "who asked" and "who approved" as the same actor, which is a real (if narrow)
+  property for a single human who wants a moment of re-confirmation to survive a fat-fingered
+  `/event` on the wrong device. That's a legitimate reason to keep it.
+- Against that: the stated motivation for this whole change is "one human with two Discord
+  accounts" (`config.py:57`), and a plausible real workflow for exactly that human is
+  starting `/event` from whichever device is at hand and confirming from whichever device
+  is *also* at hand — which may be the other account. The current design forces them back
+  to the originating account to approve, which is friction the two-account feature was
+  presumably built to reduce, not add.
+
+Both positions are defensible; this is the judgment call the brief asked for, not a bug. I
+lean toward the current (stricter) behavior being the right default for a calendar-writing
+bot — CLAUDE.md's "no exceptions" framing on the owner check reads as a preference for the
+narrower gate wherever a choice exists — but flag it as a design decision worth the user
+explicitly confirming they want, since the alternative (any owner ID may confirm any
+pending owner intent) is not a genuine security regression, only a convenience trade the
+team already chose not to make.
+
+### 5. Does the redacting `Config.__repr__` still work with a frozenset field?
+
+`Jarvis/config.py:30-37` — the redaction set (`{"discord_bot_token", "notion_token"}`,
+line 32) is a lookup by field *name*, not by type, so it's unaffected by
+`discord_owner_user_ids` changing from `int` to `frozenset[int]`; the field was never
+in the redacted set and doesn't need to be (Discord user IDs are not credentials — CLAUDE.md
+only requires redacting tokens/secrets). `getattr(self, f.name)!r` on a `frozenset[int]`
+prints `frozenset({424242, 515151})` via the default `repr`, which is exactly the intended
+"non-secrets stay readable" behavior — confirmed by
+`tests/unit/test_config.py:81` (`assert str(fake_env["DISCORD_OWNER_USER_ID1"]) in text`),
+which passes. No token leak, no update needed to the redaction set.
+
+### 6. Regressions from prior passes
+
+None found. Re-checked the items each prior pass closed: `AllowedMentions.none()` still
+set once on the `commands.Bot` constructor (`bot/client.py:58`); the three-stage
+try/except in `on_message` intact (`bot/handlers.py:131-157`); the reaction path's
+self-trigger guard (`.bot` check, `handlers.py:83-84`), atomic check-and-delete
+(`handlers.py:104`), and TTL/orphan handling from Cycle 2 all still present and unchanged
+by this diff — this change touched only `config.py`'s parsing/type and `client.py`'s
+`is_owner` body, not the reaction dispatch logic itself, and that's confirmed by reading
+it, not assumed from the diff description.
+
+### New findings
+
+None at MEDIUM or above. One informational note (item 1, negative/zero IDs) carried
+forward as pre-existing and inert, not worth action.
+
+### Verdict
+
+**Can someone else access my personal information?** No. Every parsing branch for the new
+optional key either produces a safe, exactly-as-configured membership set or crashes the
+process at startup naming only the key — no path silently admits an unintended ID or
+widens access. The rename left no stale reference anywhere in `Jarvis/` or `tests/`.
+
+**Can anyone else make calls to Jarvis?** No. All three command paths
+(`interaction_check`, `on_message`, `on_raw_reaction_add`) still route through the single
+`is_owner` function, now checking set membership instead of equality — no direct
+comparison bypasses it anywhere in the tree. The confirmation flow's same-account
+requirement (item 4) is a deliberate, tested design choice with a real but narrow security
+rationale, not a gap — flagged above as worth the user's explicit sign-off, not as a
+finding to fix.
+
+This is the smallest and most sensitive change reviewed so far, and it holds: the
+allowlist end-to-end trace from Pass 1/Cycle 2 still stands with two IDs instead of one.

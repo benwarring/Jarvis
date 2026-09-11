@@ -14,7 +14,7 @@ from dotenv import load_dotenv
 class Config:
     discord_bot_token: str
     discord_guild_id: int
-    discord_owner_user_id: int
+    discord_owner_user_ids: frozenset[int]
     discord_inbox_channel_id: int
     discord_brief_channel_id: int
     discord_grocery_channel_id: int
@@ -40,7 +40,7 @@ class Config:
 _REQUIRED = (
     "DISCORD_BOT_TOKEN",
     "DISCORD_GUILD_ID",
-    "DISCORD_OWNER_USER_ID",
+    "DISCORD_OWNER_USER_ID1",
     "DISCORD_INBOX_CHANNEL_ID",
     "DISCORD_BRIEF_CHANNEL_ID",
     "DISCORD_GROCERY_CHANNEL_ID",
@@ -54,6 +54,11 @@ _REQUIRED = (
 
 _INT_KEYS = tuple(k for k in _REQUIRED if k.startswith("DISCORD_") and k != "DISCORD_BOT_TOKEN")
 
+# One human, two Discord accounts. ID1 is required; further accounts are optional, so a
+# single-account setup needs no placeholder. Add ID3 here if a third ever shows up.
+_OWNER_KEYS = ("DISCORD_OWNER_USER_ID1", "DISCORD_OWNER_USER_ID2")
+_OPTIONAL_INT_KEYS = tuple(k for k in _OWNER_KEYS if k not in _REQUIRED)
+
 
 @lru_cache(maxsize=1)
 def get_config() -> Config:
@@ -63,6 +68,7 @@ def get_config() -> Config:
     """
     load_dotenv()
     raw = {key: os.getenv(key, "").strip() for key in _REQUIRED}
+    optional = {key: os.getenv(key, "").strip() for key in _OPTIONAL_INT_KEYS}
 
     problems = [key for key, value in raw.items() if not value]
     ints: dict[str, int] = {}
@@ -71,6 +77,13 @@ def get_config() -> Config:
             continue
         try:
             ints[key] = int(raw[key])
+        except ValueError:
+            problems.append(f"{key} (not an integer)")
+    for key, value in optional.items():
+        if not value:
+            continue
+        try:
+            ints[key] = int(value)
         except ValueError:
             problems.append(f"{key} (not an integer)")
 
@@ -82,7 +95,7 @@ def get_config() -> Config:
     return Config(
         discord_bot_token=raw["DISCORD_BOT_TOKEN"],
         discord_guild_id=ints["DISCORD_GUILD_ID"],
-        discord_owner_user_id=ints["DISCORD_OWNER_USER_ID"],
+        discord_owner_user_ids=frozenset(ints[k] for k in _OWNER_KEYS if k in ints),
         discord_inbox_channel_id=ints["DISCORD_INBOX_CHANNEL_ID"],
         discord_brief_channel_id=ints["DISCORD_BRIEF_CHANNEL_ID"],
         discord_grocery_channel_id=ints["DISCORD_GROCERY_CHANNEL_ID"],
