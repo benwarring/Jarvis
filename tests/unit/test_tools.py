@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import inspect
 from datetime import date, datetime, timezone
 
 import pytest
 
 from Jarvis.agent import tools
 from Jarvis.integrations import gcal, notion
+from Jarvis.router.intents import NAMES
 
 
 def grocery(item, id="g1"):
@@ -236,3 +238,52 @@ def test_calendar_create_writes_nothing_when_the_time_is_unreadable(monkeypatch)
     assert calls == [], "an unparseable time must never reach the calendar"
     assert event_id is None
     assert "sometime soonish" in message
+
+
+# --- the Layer 2 schemas: one per tool, no more, no fewer -------------------
+# tools.py self-checks this at import. Repeated here as a TEST so a regression
+# reports as a named failure instead of an ImportError halfway up a traceback.
+
+
+def test_every_tool_has_exactly_one_llm_name_and_one_schema():
+    schema_names = [s["function"]["name"] for s in tools.TOOL_SCHEMAS]
+
+    assert len(schema_names) == len(set(schema_names)), "a duplicate schema name"
+    assert set(schema_names) == set(tools.LLM_NAMES), "schema names and the allowlist must match"
+    assert set(tools.LLM_NAMES.values()) == set(tools.TOOLS), "every tool is reachable, exactly once"
+    assert len(tools.TOOL_SCHEMAS) == len(tools.TOOLS)
+
+
+def test_the_allowlist_only_names_real_intents():
+    assert set(tools.LLM_NAMES.values()) <= NAMES
+
+
+def test_no_llm_name_contains_a_dot():
+    """OpenAI's function-name grammar has no dot in it; the dotted registry keys
+    would be silently rejected by the API."""
+    assert not [n for n in tools.LLM_NAMES if "." in n]
+
+
+@pytest.mark.parametrize("schema", tools.TOOL_SCHEMAS, ids=lambda s: s["function"]["name"])
+def test_each_schema_matches_its_tools_signature(schema):
+    fn = schema["function"]
+    params = inspect.signature(tools.TOOLS[tools.LLM_NAMES[fn["name"]]]).parameters
+    declared = set(fn["parameters"]["properties"])
+    required = set(fn["parameters"]["required"])
+
+    assert declared <= set(params), f"the schema invents {declared - set(params)}"
+    assert required <= declared, "a required argument the model is never shown"
+    assert required == {n for n, p in params.items() if p.default is inspect.Parameter.empty}
+    assert fn["parameters"]["additionalProperties"] is False
+    assert fn["description"], "an undescribed tool gets picked at random"
+
+
+def test_the_calendar_write_is_the_only_proposal_only_tool():
+    """plan.md section 4: a calendar write is the one thing the model may only
+    PROPOSE. Widening this set silently would let the LLM write unconfirmed."""
+    assert tools.PROPOSAL_ONLY == {"calendar.create"}
+    assert tools.PROPOSAL_ONLY <= set(tools.TOOLS)
+
+
+def test_filter_args_drops_an_argument_the_tool_never_declared():
+    assert tools.filter_args("task.add", {"name": "x", "sudo": True}) == {"name": "x"}

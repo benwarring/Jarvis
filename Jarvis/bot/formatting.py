@@ -18,23 +18,31 @@ CHECK = "\N{WHITE HEAVY CHECK MARK}"
 CROSS = "\N{CROSS MARK}"
 
 
-def confirmation_embed(intent: Intent) -> discord.Embed:
-    """The ✅/❌ prompt shown before a write executes.
-
-    `calendar.create` is the only write that reaches here in Phase 4; the
-    multi-item batches plan.md section 4 also names arrive with Layer 2.
-    """
+def _line(intent: Intent) -> str:
+    """What one pending write will do, in one line."""
     args = intent.args
-    when = parse_when(args.get("when") or "")
+    if intent.name == "calendar.create":
+        when = parse_when(args.get("when") or "")
+        shown = f"{when:%a %b %d %I:%M%p}" if when else f"couldn't read a time out of '{args.get('when')}'"
+        return f"**{args.get('title', '')}** - {shown}, {args.get('duration') or DEFAULT_DURATION} min"
+    # ponytail: the intent name plus its arguments, not a hand-written phrasing per
+    # tool - that would be a second name table to keep in step with TOOLS. Prettify
+    # it when a line actually reads badly to the user.
+    return f"**{intent.name}** - " + ", ".join(str(v) for v in args.values() if v is not None)
+
+
+def confirmation_embed(intents: tuple[Intent, ...]) -> discord.Embed:
+    """The ✅/❌ prompt shown before a write executes - one line per write.
+
+    plan.md section 4 names two things that need it, a calendar write and a
+    multi-item batch, and both render the same way: a single write is a batch of
+    one, so there is no second layout to keep in step. All or nothing - one ✅
+    runs every line shown here, a ❌ runs none of them.
+    """
     embed = discord.Embed(
-        title="Create this event?",
-        description=str(args.get("title", "")),
+        title="Do this?" if len(intents) == 1 else f"Do all {len(intents)}?",
+        description="\n".join(_line(i) for i in intents),
         colour=discord.Colour.blurple(),
     )
-    embed.add_field(
-        name="When",
-        value=f"{when:%a %b %d %I:%M%p}" if when else f"couldn't read a time out of '{args.get('when')}'",
-    )
-    embed.add_field(name="Duration", value=f"{args.get('duration') or DEFAULT_DURATION} min")
-    embed.set_footer(text=f"{CHECK} create  ·  {CROSS} cancel")
+    embed.set_footer(text=f"{CHECK} confirm  ·  {CROSS} cancel")
     return embed

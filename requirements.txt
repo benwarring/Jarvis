@@ -8,8 +8,8 @@ google-auth>=2.35.0
 # Notion
 notion-client>=2.2.1
 
-# Claude
-anthropic>=0.69.0
+# LLM (Layer 2 fallback parser)
+openai>=1.109.0
 
 # Scheduling
 APScheduler>=3.10.4

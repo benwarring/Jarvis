@@ -4,8 +4,14 @@ from __future__ import annotations
 
 import pytest
 
+import os
+
+import dotenv
+
 from Jarvis.bot.client import is_owner
 from Jarvis.config import get_config
+
+from tests.conftest import FAKE_ENV
 
 
 def test_config_reads_the_environment(fake_env):
@@ -77,5 +83,52 @@ def test_repr_redacts_the_tokens(fake_env):
     text = repr(get_config())
     assert fake_env["DISCORD_BOT_TOKEN"] not in text
     assert fake_env["NOTION_TOKEN"] not in text
+    assert fake_env["OPENAI_API_KEY"] not in text, "the OpenAI key is a credential too"
     assert "***" in text
     assert str(fake_env["DISCORD_OWNER_USER_ID1"]) in text, "non-secrets stay readable"
+
+
+def test_a_non_numeric_spend_limit_is_rejected(monkeypatch):
+    """The spend ceiling is the only thing between a bug and a real bill."""
+    monkeypatch.setenv("LLM_DAILY_SPEND_LIMIT_USD", "a dollar fifty")
+    get_config.cache_clear()
+    with pytest.raises(SystemExit) as exc:
+        get_config()
+    assert "LLM_DAILY_SPEND_LIMIT_USD" in str(exc.value)
+    assert "a dollar fifty" not in str(exc.value)
+
+
+def test_the_llm_keys_are_typed_and_present(fake_env):
+    cfg = get_config()
+    assert cfg.openai_model == fake_env["OPENAI_MODEL"]
+    assert cfg.llm_daily_spend_limit_usd == float(fake_env["LLM_DAILY_SPEND_LIMIT_USD"])
+    assert isinstance(cfg.llm_daily_spend_limit_usd, float), "a string compares wrong against spend"
+
+
+# --- test isolation: the suite must never see the real .env -----------------
+
+
+def test_the_environment_a_test_sees_is_the_fake_one():
+    """Regression. `utils/logging.py` calls load_dotenv on every get_logger, so
+    importing almost any Jarvis module used to pull the real .env - live Notion,
+    Google and OpenAI credentials - into os.environ process-wide, where monkeypatch
+    cannot undo it. The suite went green only by import order; test_dates.py alone
+    failed. Worse, a test that missed a stub would then reach a REAL API with a REAL
+    key instead of failing loudly.
+
+    If this fails, a real credential is in the test process. Fix conftest, not this.
+    """
+    for key, value in FAKE_ENV.items():
+        assert os.environ[key] == value, f"{key} is not the fake value the fixture set"
+    assert dotenv.load_dotenv() is False, "load_dotenv must be neutered at the source"
+
+
+def test_no_jarvis_module_can_reopen_the_real_env():
+    """The source patch, not just the two module attributes: a module importing
+    `load_dotenv` after conftest ran gets the stub too."""
+    from Jarvis.utils import logging as logging_module
+
+    from Jarvis import config as config_module
+
+    assert config_module.load_dotenv() in (None, False)
+    assert logging_module.load_dotenv() in (None, False)

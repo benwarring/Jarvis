@@ -619,3 +619,287 @@ describe the code accurately in both directions. 376/376 tests pass, and the
 new confirmation-flow tests are genuinely load-bearing rather than
 tautological. Phase 5 (the LLM tool-use loop) can be built on this without
 first returning to Phase 3/4 code.
+
+---
+
+# Phase 5 Review — Layer 2
+
+Scope: the LLM tool-use loop only — `router/llm.py`, `integrations/llm.py`,
+`agent/tools.py`, `bot/handlers.py`, `config.py`, `storage/models.py`,
+`utils/logging.py`, `requirements.txt`, `tests/unit/test_llm.py` — plus
+plan.md §3, §6, §10, §11 (edited this cycle). Phases 1-4 are not re-audited.
+Did not run pytest and made no OpenAI call, per the review's own constraints.
+
+## Findings
+
+### HIGH
+
+**H1 — Multi-item batches from Layer 2 execute unconfirmed, contradicting
+plan.md §4 and CLAUDE.md.** File: `Jarvis/router/llm.py:115-134`
+(`_run_tools`). Both plan.md §4 ("Calendar writes and any multi-item batch
+render as an embed with ✅/❌ reactions before executing") and CLAUDE.md
+("Calendar writes and multi-item batches require ✅ confirmation before
+executing") name two categories that need confirmation. Only one is
+implemented: `PROPOSAL_ONLY = frozenset({"calendar.create"})`
+(`agent/tools.py:183`) intercepts calendar writes; everything else in
+`_run_tools`'s loop dispatches immediately, with no batch detection at all.
+A single Layer 2 reply that emits three `add_task`/`add_grocery_item` calls
+— entirely plausible phrasing: "add milk and eggs, and remind me to call
+mom" — runs all three Notion writes with zero confirmation. This is new
+exposure Phase 5 introduces: no earlier layer can produce more than one
+write Intent per message (a slash command or a fast-path regex match always
+yields exactly one), so this failure mode did not exist before Layer 2.
+The gap is not an oversight the implementer missed — `bot/formatting.py:24-25`
+says outright "`calendar.create` is the only write that reaches here in
+Phase 4; the multi-item batches plan.md section 4 also names arrive with
+Layer 2," i.e. the code's own comment predicts this and it was not built.
+`confirmation_embed` (`bot/formatting.py:21-40`) also only knows how to
+render a `calendar.create` intent (title/when/duration fields) — there is no
+data shape yet for "these three writes are queued, confirm all or none."
+Fix: extend `PROPOSAL_ONLY`-style handling so any round producing more than
+one non-read tool call collects them into a batch proposal (new `Intent`
+shape, or a list of intents) routed through the same `_prompt` confirmation
+door single calendar writes already use, with a batch-rendering branch in
+`confirmation_embed`. Given the model in `.env` is explicitly a small one
+("a cheaper model misparses more often," plan.md §4), this is exactly the
+scenario the confirmation guardrail exists for.
+
+### MEDIUM
+
+None.
+
+### LOW
+
+**L1 — `storage/db.py:1` docstring is stale.** "One table for now; the rest
+arrive with their phases" — `llm_spend` was added this cycle (§6), so there
+are two. Harmless, no runtime effect; fix the next time the file is touched.
+
+**L2 — `conftest.py`'s comment about `utils/logging.py` describes the
+pre-fix behavior.** `tests/conftest.py:21-22` says "the logging one fires on
+any `get_logger` call," but the code it is describing
+(`Jarvis/utils/logging.py:17`) now calls `load_dotenv()` once at import, not
+per call — that's the fix this cycle made. The conftest safeguard (patching
+`dotenv.load_dotenv` before the first Jarvis import) still holds either way,
+so nothing is actually broken, but the comment now documents a bug that no
+longer exists in the file it's pointing at. Worth a one-line correction next
+time either file is touched.
+
+## Plan honesty (item 1)
+
+Checked §3, §6, §10, §11 against the code rather than against memory of
+prior passes:
+
+- **§3** — `router/llm.py` (Layer 2 loop), `integrations/llm.py` (transport +
+  cost accounting), and the claim that tool schemas "live in `agent/tools.py`
+  beside the implementations they describe, so the two cannot drift apart"
+  all match: `TOOL_SCHEMAS` sits in `tools.py` next to `TOOLS`, and
+  `integrations/llm.py` contains no schema. `bot/formatting.py`'s "List
+  rendering is NOT here" claim still holds — `_format_tasks`/`_format_groceries`/
+  `_format_events` are still private to `tools.py`. Accurate.
+- **§6** — `llm_spend` exists exactly as described (`storage/db.py:19-24`,
+  `storage/models.py:42-60`), one row per local day, backing the spend guard.
+  `conversations` is genuinely absent — no such table, and `router/llm.py`
+  builds a fresh two-message list per call with no persisted context. The
+  "not built" framing is accurate, not flattering.
+- **§10** — "RESOLVED": `requirements.txt` pins `openai>=1.109.0` with no
+  `anthropic` anywhere in the file. Accurate.
+- **§11** — the $0.40 / $1.60 per-1M-token figures in the plan match
+  `integrations/llm.py:31` (`gpt-4.1-mini`) exactly, including the source URL
+  and verification date in both places. Accurate.
+- **§4 vs `handlers.py`** — still matches: slash commands go through Discord
+  interactions directly (not `on_message`), `on_message` runs the fast-path
+  and falls through to `_layer2` on a miss, and Layer 2's only write path
+  (`calendar.create`) is routed through the same `_prompt` confirmation
+  `/event` uses. The one place §4 is *not* fully matched is the multi-item
+  batch sentence in the same section — see H1. That's a code gap, not a plan
+  misstatement; the plan states the requirement correctly and the code
+  doesn't meet it yet.
+
+No instance of the plan being softened to flatter the code was found in the
+sections edited this cycle. If anything §10/§11 undersell nothing, and H1
+shows the opposite failure mode didn't happen either (the plan wasn't quietly
+narrowed to drop the batch requirement once it turned out inconvenient — it's
+still there, unmet).
+
+## One implementation per capability (item 2)
+
+Traced all three doors onto `calendar.create` and confirmed no second
+implementation exists:
+
+- Slash command: `bot/commands/event.py:26` builds `Intent(name="calendar.create", ...)`
+  and calls `confirm()`.
+- Fast-path: does not produce `calendar.create` (not in its pattern table —
+  correct, calendar creation was never a Layer 1 capability).
+- Layer 2: `router/llm.py:130-132` builds the same `Intent(name="calendar.create", ...)`
+  shape and returns it instead of dispatching it.
+
+`confirm()` and `_layer2()` both call the same `_prompt(send, intent,
+requester_id)` (`bot/handlers.py:55-78`, called at lines 87 and 157) — one
+function, two callers differing only in how the confirmation embed gets
+posted (`interaction.response.send_message` vs `message.reply`). This is
+genuinely shared, not duplicated: reading `_prompt`'s body top to bottom,
+there is nothing Layer-2-specific or slash-specific inside it. All reads and
+non-calendar writes route through `agent.manager.dispatch`, which looks the
+tool up in the single `TOOLS` dict (`agent/tools.py:148-159`) — confirmed by
+reading `manager.py` in full; it contains no second tool table and no
+capability-specific branching. Clean.
+
+## Ruling on item 3 — the `handle` return-type deviation
+
+`handle` returns `tuple[str, str | None] | Intent | None` instead of the
+addendum's contracted two-arm shape. The stated reasons are both real
+constraints, not excuses: a `(message, external_id)` tuple has no slot to
+carry a full `Intent` (name + args + source), and `router/` importing from
+`bot/` would point the plan's §3 dependency arrow backwards (`router` sits
+below `bot` in the layering: `bot -> agent -> router -> integrations`).
+
+Given those two constraints, the alternative the implementer says they
+rejected — a second exported function — would have made the router's public
+surface *wider* (two entry points a caller has to know to call in the right
+circumstances) for the same information a third return type carries in one
+call. The deviation also doesn't introduce a foreign type: `Intent` is
+already the currency the fast-path and slash commands hand to `dispatch`, so
+Layer 2 handing one back for a write is reusing an existing, well-understood
+shape rather than inventing a new one. The caller
+(`bot/handlers.py:154-160`) discriminates with one `isinstance(outcome,
+Intent)` check, which reads plainly at the call site.
+
+**Ruling: right call.** A tuple that could secretly mean "here's a proposal"
+via some sentinel value would be worse — more implicit, not less. The one
+thing worth tightening: the union's docstring (`router/llm.py:48-61`)
+explains *why* the shape deviates, but a one-line note in plan.md §3 or §4
+pointing at the actual signature would save the next reader from re-deriving
+this from the docstring alone. Not a blocker.
+
+## Ruling on item 5 — `llm.py`'s inline try/except vs. `_call` wrappers
+
+Checked call-site counts, since that's what a wrapper buys: `notion._call`
+is invoked from at least six sites (`add_task`, `list_open_tasks`,
+`_set_property` used by `complete_task`, `add_grocery`, `list_groceries`,
+plus category lookups), and `gcal._call` from at least two
+(`list_events`, `create_event`), all sharing byte-identical
+try/log-type-name/raise-domain-error logic. Factoring that out is what
+"one implementation per capability" is for — six copies of the same
+except-block would itself be the repeated-code finding.
+
+`integrations/llm.py` has exactly one call site for the OpenAI client:
+`complete()`. There is nothing to de-duplicate. A `_call` wrapper here would
+be an interface with one implementation and one caller — the same shape
+CLAUDE.md's "one implementation per capability" rule and the standards
+persona both argue against, just pointed the other direction (an
+abstraction with no second user, rather than a second implementation of one
+capability). The inline try/except in `complete()`
+(`integrations/llm.py:72-82`) preserves every property that matters —
+type-name-only logging, no key/prompt/response body reaching a log line or
+exception, `LLMError` as the one exception type callers see — it's just not
+extracted into a named function nobody else calls.
+
+**Ruling: not a smell, correctly not wrapped.** Wrapping it would be
+gratuitous symmetry with `notion.py`/`gcal.py` for its own sake, not for a
+second call site. If `integrations/llm.py` grows a second network call
+(e.g. embeddings, or a moderation pre-check) before Phase 9's retry/backoff
+work lands, that's the trigger to extract `_call` — not before.
+
+## Ruling on item 7 — `load_dotenv()` moved to import time in `utils/logging.py`
+
+The bug it replaces was real: `get_logger()` previously called
+`load_dotenv()` on every invocation, and since `get_logger(__name__)` runs at
+import time in roughly every module in the tree, that meant many
+re-invocations per test session, each one able to pull real `.env` values
+into `os.environ` at an unpredictable point relative to `monkeypatch`
+fixtures — `tests/conftest.py:20-27` documents this exact failure ("whichever
+module imported first pulled the real .env... into os.environ process-wide,
+where monkeypatch cannot undo it, and every later test in the session saw
+them"). Moving the call to module level cuts that from N call sites to one,
+which is a real reduction in surface, not just a relocation.
+
+It does not eliminate the side effect, though — it changes it from "mutates
+`os.environ` on a schedule nobody controls" to "mutates `os.environ`
+unconditionally, once, the first time anything imports `Jarvis.utils.logging`
+(which is nearly everything, transitively)." That single mutation still
+happens before `Config` is ever validated, and `config.py`'s own docstring
+("Reads .env once; no other module touches os.environ") is no longer
+literally true — `.env` is now read at both `utils/logging.py` import time
+and inside `config.get_config()`. `python-dotenv`'s default `override=False`
+makes the double-read harmless in practice (the second call cannot clobber
+values already present), and `conftest.py`'s belt-and-braces patch (stubbing
+`dotenv.load_dotenv` at the source before the first `Jarvis` import, plus
+re-stubbing both module-level names in the autouse fixture) neutralizes it
+fully for the test suite specifically. So functionally this is closed.
+
+**Ruling: the right fix for the bug it targets, but it trades one smell for
+a smaller one rather than for nothing** — an import-time side effect in a
+module every other module pulls in is still surprising to a future reader,
+and `config.py`'s "no other module touches os.environ" line is now
+technically inaccurate (L2 above already flags the adjacent conftest comment
+going stale in the other direction). Given `LOG_LEVEL` genuinely needs to be
+readable before `Config` can fail loudly, and given the alternative (reading
+`os.environ` directly for just `LOG_LEVEL`, sidestepping `dotenv` entirely in
+this one file) would avoid the second `load_dotenv` call site without losing
+anything `.env`-file support currently provides — that's a smaller fix than
+what shipped, but not one this review is blocking Phase 5 on. Worth a
+one-line amendment to `config.py`'s docstring acknowledging the second call
+site exists and why.
+
+## Test quality (item 6)
+
+Spot-checked the two named guards, and both assert on calls, not just
+returns:
+
+- **Proposal-only guard** — `test_a_model_proposed_calendar_write_is_handed_back_not_dispatched`
+  and `test_a_proposal_stops_everything_after_it_in_the_same_reply`
+  (`test_llm.py:99-143`) both patch `router.dispatch` via the `dispatched`
+  fixture and assert `dispatched == []`, not just that the return value is an
+  `Intent`. `test_a_proposed_write_does_not_touch_the_calendar_end_to_end`
+  goes one step further and patches `gcal.create_event` directly, so a leak
+  through any path other than `dispatch` would still be caught.
+- **Spend guard** — `test_at_or_over_the_daily_limit_layer2_makes_zero_api_calls`
+  uses `no_api_calls`, which doesn't just record calls — the stub raises
+  `AssertionError` if invoked at all, and the test's own comment
+  (`test_llm.py:170-171`) explains why it's `AssertionError` and not
+  `LLMError`: `handle()` swallows `LLMError` into the same `FALLBACK` string
+  the guard itself returns, so an `LLMError`-based stub would make "the guard
+  never fired" indistinguishable from "the guard fired correctly." Using an
+  exception type `handle()` does not catch is what makes this test
+  load-bearing rather than cosmetic.
+
+Both hold up under the "assert what was called" bar the file's own docstring
+sets. No gap found in these two.
+
+## Verdict on the four review questions
+
+1. **Unnecessarily repeated code?** None found in the reviewed files. The
+   inline try/except in `integrations/llm.py` looking different from
+   `notion.py`/`gcal.py` is deliberate and correct (item 5) — one call site
+   doesn't earn a wrapper.
+2. **Helper-function use / modularity?** Yes — `_prompt` is genuinely shared
+   between the slash-command and Layer 2 confirmation doors, `_run_tools` and
+   `filter_args` cleanly separate "what did the model ask for" from "what is
+   it allowed to touch," and `_check_schemas()` is load-bearing self-checked
+   coupling between `TOOLS` and `TOOL_SCHEMAS` (verified all four failure
+   modes the review asked about: a missing schema and an extra schema both
+   trip the `named == set(LLM_NAMES)` assert, an invented parameter trips
+   `declared <= set(params)`, and a wrong `required` list trips the
+   `needed == set(required)` assert).
+3. **Does the code do what it promises?** Mostly. Every promise checked
+   holds except one: plan.md §4's multi-item-batch confirmation requirement
+   is not implemented for Layer 2, and the code's own comment
+   (`bot/formatting.py:24-25`) shows this was a known, named gap rather than
+   an accidental one. See H1.
+4. **Does the code match plan.md?** Yes on §3, §6, §10, §11 — all four
+   sections edited this cycle describe the code as it actually is, not as a
+   flattering approximation of it. The one mismatch (H1) is the code falling
+   short of an accurate plan, not the plan being loosened to match the code.
+
+## Phase 6 readiness
+
+**Not blocked, but H1 should be fixed before Phase 6 (or explicitly
+deferred in plan.md with a reason) rather than carried silently.** The daily
+brief (Phase 6) doesn't touch Layer 2's tool loop or the confirmation flow at
+all — it's a scheduled job reading Calendar/Notion and making its own single
+LLM call for prose, a different code path entirely — so nothing in Phase 6
+depends on H1 being fixed first. Everything else reviewed (spend guard,
+schema/tool coupling, the allowlist on tool names and arguments, and the
+proposal-only gate for calendar writes specifically) is solid and gives
+Phase 6 a correct foundation to build the "one LLM call, deterministic
+fallback on failure" pattern plan.md §5a already commits to.

@@ -9,6 +9,7 @@ or a Google Calendar event id).
 
 from __future__ import annotations
 
+import inspect
 from collections.abc import Callable
 from datetime import datetime
 from typing import TypeVar
@@ -156,3 +157,137 @@ TOOLS: dict[str, Callable[..., str | tuple[str, str | None]]] = {
     # write only runs from the confirmation flow, after a human ✅.
     "calendar.create": calendar_create,
 }
+
+
+# --- Layer 2: what the model is allowed to ask for ---------------------------
+# The schemas live here, next to the implementations they describe, so a renamed
+# parameter breaks the self-check below instead of surfacing as a confused bot.
+
+# The model never sees the dotted registry keys - OpenAI's function-name grammar
+# has no dot in it. These are plan.md section 4's names, one per TOOLS entry, and
+# this dict is the ALLOWLIST the router validates model output against: a name
+# that is not a key here never reaches dispatch.
+LLM_NAMES: dict[str, str] = {
+    "add_grocery_item": "grocery.add",
+    "list_groceries": "grocery.list",
+    "check_off_grocery": "grocery.check",
+    "add_task": "task.add",
+    "list_tasks": "task.list",
+    "complete_task": "task.complete",
+    "list_calendar_events": "calendar.agenda",
+    "create_calendar_event": "calendar.create",
+}
+
+# plan.md section 4 / CLAUDE.md: a calendar write is never executed by the layer
+# that parsed it. The model may PROPOSE this one; only a human's ✅ runs it.
+PROPOSAL_ONLY = frozenset({"calendar.create"})
+
+# The other half of the same rule - "calendar writes AND multi-item batches" need
+# a ✅ - so Layer 2 can count the writes in one reply. The reads (grocery.list,
+# task.list, calendar.agenda) are left out on purpose.
+WRITE_NAMES = frozenset(
+    {"grocery.add", "grocery.check", "task.add", "task.complete", "calendar.create"}
+)
+
+_STR = {"type": "string"}
+
+
+def _fn(name: str, description: str, properties: dict[str, dict], required: list[str]) -> dict:
+    return {
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": description,
+            "parameters": {
+                "type": "object",
+                "properties": properties,
+                "required": required,
+                "additionalProperties": False,
+            },
+        },
+    }
+
+
+# Dates and times are passed through as the user's own words: `utils/dates.parse_when`
+# resolves them, so the model never has to know what day it is (and we never have to
+# spend tokens telling it).
+TOOL_SCHEMAS: list[dict] = [
+    _fn(
+        "add_grocery_item",
+        "Add one item to the grocery list.",
+        {"item": _STR | {"description": "What to buy, e.g. 'milk'."},
+         "qty": _STR | {"description": "How much, e.g. '2 lbs'. Omit if unsaid."}},
+        ["item"],
+    ),
+    _fn("list_groceries", "Read the grocery list back.", {}, []),
+    _fn(
+        "check_off_grocery",
+        "Tick one item off the grocery list.",
+        {"query": _STR | {"description": "Part of the item's name."}},
+        ["query"],
+    ),
+    _fn(
+        "add_task",
+        "Add one task to the to-do list.",
+        {"name": _STR | {"description": "What needs doing."},
+         "due": _STR | {"description": "When it is due, in the user's own words, e.g. 'friday 5pm'."}},
+        ["name"],
+    ),
+    _fn("list_tasks", "Read the open tasks back.", {}, []),
+    _fn(
+        "complete_task",
+        "Mark one open task done.",
+        {"query": _STR | {"description": "Part of the task's name."}},
+        ["query"],
+    ),
+    _fn(
+        "list_calendar_events",
+        "Read the calendar for one day.",
+        {"day": _STR | {"description": "Which day, in the user's own words. Omit for today."}},
+        [],
+    ),
+    _fn(
+        "create_calendar_event",
+        "Propose a new calendar event. The user has to confirm it before it is created.",
+        {"title": _STR | {"description": "What the event is."},
+         "when": _STR | {"description": "Start time in the user's own words, e.g. 'tomorrow 3pm'."},
+         "duration": {"type": "integer", "description": "Length in minutes. Omit for the default."}},
+        ["title", "when"],
+    ),
+]
+
+
+def filter_args(name: str, args: dict) -> dict:
+    """Drop arguments the tool does not declare. Model output is untrusted input."""
+    allowed = inspect.signature(TOOLS[name]).parameters
+    return {key: value for key, value in args.items() if key in allowed}
+
+
+def _check_schemas() -> None:
+    """Every tool has a schema and every schema has a tool - checked, not hoped for.
+
+    A drifted name or parameter is otherwise silent until a user trips over it.
+    """
+    named = {schema["function"]["name"] for schema in TOOL_SCHEMAS}
+    assert named == set(LLM_NAMES), f"schema/name mismatch: {named ^ set(LLM_NAMES)}"
+    assert set(LLM_NAMES.values()) == set(TOOLS), (
+        f"tool/name mismatch: {set(LLM_NAMES.values()) ^ set(TOOLS)}"
+    )
+    assert PROPOSAL_ONLY <= WRITE_NAMES <= set(TOOLS), "a proposal-only or write name that is not a tool"
+    for schema in TOOL_SCHEMAS:
+        fn = schema["function"]
+        params = inspect.signature(TOOLS[LLM_NAMES[fn["name"]]]).parameters
+        declared = set(fn["parameters"]["properties"])
+        assert declared <= set(params), f"{fn['name']}: schema invents {declared - set(params)}"
+        needed = {n for n, p in params.items() if p.default is inspect.Parameter.empty}
+        assert needed == set(fn["parameters"]["required"]), f"{fn['name']}: wrong required list"
+
+
+_check_schemas()  # cheap, and a mismatch is a bug that ships silently otherwise
+
+
+if __name__ == "__main__":
+    _check_schemas()
+    assert filter_args("task.add", {"name": "x", "sudo": True}) == {"name": "x"}
+    assert not WRITE_NAMES & {"grocery.list", "task.list", "calendar.agenda"}, "a read is not a write"
+    print(f"tools ok - {len(TOOLS)} tools, {len(TOOL_SCHEMAS)} schemas")

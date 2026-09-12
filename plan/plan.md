@@ -136,7 +136,9 @@ Jarvis/
                        when the daily brief is the first thing to consume it)
     notion.py          add_task, add_grocery, query_open_tasks, complete_task
     weather.py         current conditions + daily forecast
-    llm.py             LLM client wrapper, tool schemas
+    llm.py             LLM client wrapper + cost accounting. Tool *schemas* live in
+                       agent/tools.py beside the implementations they describe, so
+                       the two cannot drift apart
   scheduler/
     jobs.py            registered cron jobs
     planner.py         daily brief construction
@@ -303,7 +305,8 @@ Category is auto-assigned by the fast-path from a static keyword map
 | `briefs` | One row per generated brief; prevents double-posting after a restart |
 | `reminders_fired` | One row per delivered reminder; prevents double-notifying after a restart |
 | `weather_cache` | One row per day; keeps the morning fetch serving `/weather` all day |
-| `conversations` | Rolling short-term context for Layer 2 multi-turn |
+| `conversations` | Rolling short-term context for Layer 2 multi-turn. **Not built** — Layer 2 is single-turn, and a rolling context multiplies both tokens and prompt-injection surface for no demonstrated need |
+| `llm_spend` | One row per local day: tokens and USD. Backs the §11 spend guard |
 | `cache` | Notion database schema cache, so properties aren't re-fetched every call |
 
 ---
@@ -385,19 +388,18 @@ Run both at the end of every build phase in §12, not just at the end of the pro
 
 ---
 
-## 10. Provider inconsistency — resolve before Phase 5
+## 10. Provider inconsistency — RESOLVED
 
-`.env` configures `OPENAI_API_KEY` and `OPENAI_MODEL`, with no Anthropic keys
-present — so OpenAI is the configured provider, and the markdown (this plan,
-`CLAUDE.md`, `AGENTS.md`) has been made consistent with it.
+`.env` configures `OPENAI_API_KEY` and `OPENAI_MODEL` with no Anthropic keys present,
+so OpenAI is the provider. The markdown was made consistent with that first, and
+`requirements.txt` now pins `openai` instead of `anthropic` — settled deliberately at
+the start of Phase 5, as this section required, rather than drifting into it.
 
-**One item is still outstanding: `requirements.txt` pins `anthropic` and no OpenAI
-client.** That is a dependency change rather than a doc fix, so it is left for a
-deliberate commit — swapping it silently would install one SDK and orphan another.
+Historical note, kept because it explains the delay: the swap was held back through
+Phases 1-4 because it is a dependency change rather than a doc fix, and doing it
+silently would have installed one SDK and orphaned another.
 
-Nothing before Phase 5 touches the LLM, so this is not blocking — but it must be
-settled before Layer 2 is built, not during. Whoever does it should also confirm
-the §11 cost figures against current OpenAI pricing.
+The §11 figures were re-baselined against OpenAI's published pricing at the same time.
 
 ---
 
@@ -409,10 +411,17 @@ Reminders and the weather update are deterministic and cost nothing.
 The lever that matters is fast-path hit rate, not model choice — every message
 Layer 1 catches is a request that never happens. That holds regardless of provider.
 
-**The dollar figures in this section still need re-baselining** against current
-OpenAI pricing for the configured model; the previous numbers were Anthropic's and
-have been removed rather than left to mislead. Two structural points survive the
-provider change:
+Rates for the configured model, `gpt-4.1-mini`, verified against OpenAI's pricing
+docs on 2026-09-11: **$0.40 per 1M input tokens, $1.60 per 1M output tokens** (standard
+tier). The same table in `integrations/llm.py` is hand-maintained and carries the source
+URL and that date — it is the one number in the codebase that goes stale silently, so
+re-check it when the spend guard starts behaving oddly in either direction.
+
+An unpriced model falls back to the most expensive known rate. That direction is
+deliberate: over-charging trips the guard early and visibly, while under-charging
+disables it quietly.
+
+Two structural points, independent of provider:
 
 - **Skip prompt caching at first.** Caching pays off across requests that share a
   large prefix inside a short window. A personal bot's traffic is sporadic single

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable
 from time import monotonic
 
 import discord
@@ -11,6 +12,7 @@ from Jarvis.agent.manager import dispatch
 from Jarvis.bot.client import is_owner
 from Jarvis.bot.formatting import CHECK, CROSS, confirmation_embed
 from Jarvis.config import get_config
+from Jarvis.router import llm
 from Jarvis.router.fastpath import parse
 from Jarvis.router.intents import Intent
 from Jarvis.storage.models import record_message
@@ -29,7 +31,17 @@ CONFIRMATION_TTL_SECONDS = 600
 # survive restarts and buy nothing else — add one only if Jarvis starts restarting
 # mid-confirmation often enough to annoy. Expiry is likewise lazy: entries are checked
 # when someone reacts, not swept, so an ignored one just sits there until it doesn't.
-PENDING: dict[int, tuple[Intent, int, float]] = {}
+# The value holds a TUPLE of intents - one write, or the whole batch plan.md section
+# 4 wants confirmed together - plus who asked and when.
+PENDING: dict[int, tuple[tuple[Intent, ...], int, float]] = {}
+
+# Posts the confirmation embed and returns the message it landed on.
+Send = Callable[[discord.Embed], Awaitable[discord.Message]]
+
+
+def _names(intents: tuple[Intent, ...]) -> str:
+    """Intent names for a log line - never the args, which carry user content."""
+    return ", ".join(i.name for i in intents)
 
 
 async def _run(intent: Intent) -> tuple[str, str | None]:
@@ -47,26 +59,41 @@ async def respond(interaction: discord.Interaction, intent: Intent) -> None:
         log.exception("Discord call failed answering %s", intent.name)
 
 
-async def confirm(interaction: discord.Interaction, intent: Intent) -> None:
-    """Write path: show the embed, park the intent, let a reaction decide.
+async def _prompt(send: Send, intents: tuple[Intent, ...], requester_id: int) -> None:
+    """Write path: show the embed, park the intents, let one reaction decide.
 
-    plan.md section 4 / CLAUDE.md: a calendar write never executes unconfirmed, so
-    this deliberately does NOT dispatch. `on_raw_reaction_add` does, or nobody does.
+    plan.md section 4 / CLAUDE.md: neither a calendar write nor a multi-item batch
+    executes unconfirmed, so this deliberately does NOT dispatch.
+    `on_raw_reaction_add` does, or nobody does.
+
+    `send` is the only thing that differs between a slash command and a Layer 2
+    proposal, so it is the only thing either caller supplies. There is one copy of
+    the confirmation flow and both doors open onto it.
     """
     try:
-        await interaction.response.send_message(embed=confirmation_embed(intent))
-        message = await interaction.original_response()
+        posted = await send(confirmation_embed(intents))
         # Registered before the reactions go on, so a fast ✅ can't beat the entry.
-        PENDING[message.id] = (intent, interaction.user.id, monotonic())
+        PENDING[posted.id] = (intents, requester_id, monotonic())
         try:
-            await message.add_reaction(CHECK)
-            await message.add_reaction(CROSS)
+            await posted.add_reaction(CHECK)
+            await posted.add_reaction(CROSS)
         except discord.DiscordException:
             # Half-reacted prompt: drop the entry rather than leave it live forever.
-            PENDING.pop(message.id, None)
+            PENDING.pop(posted.id, None)
             raise
     except discord.DiscordException:
-        log.exception("Couldn't put up the confirmation for %s", intent.name)
+        log.exception("Couldn't put up the confirmation for %s", _names(intents))
+
+
+async def confirm(interaction: discord.Interaction, intent: Intent) -> None:
+    """Slash-command door onto the confirmation flow."""
+
+    async def send(embed: discord.Embed) -> discord.Message:
+        await interaction.response.send_message(embed=embed)
+        return await interaction.original_response()
+
+    # One write, so a one-tuple: a batch is the same path with more in it.
+    await _prompt(send, (intent,), interaction.user.id)
 
 
 async def on_raw_reaction_add(payload: discord.RawReactionActionEvent) -> None:
@@ -92,7 +119,7 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent) -> None:
     if not is_owner(payload.user_id):
         log.warning("Ignored confirmation reaction from non-owner %s", payload.user_id)
         return
-    intent, requester_id, created_at = pending
+    intents, requester_id, created_at = pending
     if payload.user_id != requester_id:
         return
     emoji = str(payload.emoji)
@@ -108,20 +135,47 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent) -> None:
     elif emoji == CROSS:
         result = "Cancelled — nothing was created."
     else:
-        result, external_id = await _run(intent)
-        try:
-            record_message(payload.message_id, intent.name, intent.args, external_id)
-        except Exception:
-            log.exception("Couldn't record confirmed %s", intent.name)
+        # Every one of them, in the order they were shown: the ✅ was for the batch.
+        lines: list[str] = []
+        for intent in intents:
+            line, external_id = await _run(intent)
+            lines.append(line)
+            try:
+                # ponytail: one row per Discord message id (it is the primary key), so
+                # a batch leaves only its last write recorded. Fine while the row is
+                # just idempotency bookkeeping; needs its own table for ❌-undo.
+                record_message(payload.message_id, intent.name, intent.args, external_id)
+            except Exception:
+                log.exception("Couldn't record confirmed %s", intent.name)
+        result = "\n".join(lines)
 
     try:
         channel = payload.member.guild.get_channel_or_thread(payload.channel_id)
         if channel is None:
-            log.warning("Channel %s not in cache; ran %s without replying", payload.channel_id, intent.name)
+            log.warning("Channel %s not in cache; ran %s without replying", payload.channel_id, _names(intents))
             return
         await channel.send(result)
     except discord.DiscordException:
-        log.exception("Couldn't report the outcome of %s", intent.name)
+        log.exception("Couldn't report the outcome of %s", _names(intents))
+
+
+async def _layer2(message: discord.Message) -> None:
+    """Fast-path miss -> the LLM (plan.md section 4). Owner-checked by the caller.
+
+    Writes the model proposed - a calendar write, or a batch of them - go through the
+    SAME ✅ flow `/event` uses; nothing has been written when they get here, and
+    nothing will be until someone reacts. Reads just answer.
+    """
+    # Spend guard, HTTP and sqlite - all blocking, none of it on the gateway loop.
+    outcome = await asyncio.to_thread(llm.handle, message.content)
+    if outcome is None:
+        return
+    # Both arms are non-empty tuples; only the proposal arm holds Intents.
+    if isinstance(outcome[0], Intent):
+        await _prompt(lambda embed: message.reply(embed=embed), outcome, message.author.id)
+        return
+    # No ✅ reaction here: a sentence is its own acknowledgement.
+    await message.reply(outcome[0])
 
 
 async def on_message(message: discord.Message) -> None:
@@ -134,7 +188,7 @@ async def on_message(message: discord.Message) -> None:
             in_grocery_channel=message.channel.id == get_config().discord_grocery_channel_id,
         )
         if intent is None:
-            return  # Layer 2 (the LLM) is Phase 5. Silence is the correct miss behaviour.
+            return await _layer2(message)  # the regex missed; the LLM gets a go
         result, external_id = await _run(intent)
     except Exception:
         log.exception("Couldn't handle message %s", message.id)

@@ -1,4 +1,4 @@
-"""Single source of configuration. Reads .env once; no other module touches os.environ."""
+"""Single source of configuration. Reads .env once; only utils/logging.py also touches os.environ (see the note there)."""
 
 from __future__ import annotations
 
@@ -24,12 +24,15 @@ class Config:
     notion_groceries_db_id: str
     google_service_account_file: str
     google_calendar_id: str
+    openai_api_key: str
+    openai_model: str
+    llm_daily_spend_limit_usd: float
     timezone: str
     db_path: str
 
     def __repr__(self) -> str:
         """Redacted, so log.info(config) or a traceback holding it can never leak a token."""
-        redacted = {"discord_bot_token", "notion_token"}
+        redacted = {"discord_bot_token", "notion_token", "openai_api_key"}
         fields = ", ".join(
             f"{f.name}={'***' if f.name in redacted else getattr(self, f.name)!r}"
             for f in dataclasses.fields(self)
@@ -50,9 +53,13 @@ _REQUIRED = (
     "NOTION_GROCERIES_DB_ID",
     "GOOGLE_SERVICE_ACCOUNT_FILE",
     "GOOGLE_CALENDAR_ID",
+    "OPENAI_API_KEY",
+    "OPENAI_MODEL",
+    "LLM_DAILY_SPEND_LIMIT_USD",
 )
 
 _INT_KEYS = tuple(k for k in _REQUIRED if k.startswith("DISCORD_") and k != "DISCORD_BOT_TOKEN")
+_FLOAT_KEYS = ("LLM_DAILY_SPEND_LIMIT_USD",)
 
 # One human, two Discord accounts. ID1 is required; further accounts are optional, so a
 # single-account setup needs no placeholder. Add ID3 here if a third ever shows up.
@@ -79,6 +86,14 @@ def get_config() -> Config:
             ints[key] = int(raw[key])
         except ValueError:
             problems.append(f"{key} (not an integer)")
+    floats: dict[str, float] = {}
+    for key in _FLOAT_KEYS:
+        if not raw[key]:
+            continue
+        try:
+            floats[key] = float(raw[key])
+        except ValueError:
+            problems.append(f"{key} (not a number)")
     for key, value in optional.items():
         if not value:
             continue
@@ -105,6 +120,9 @@ def get_config() -> Config:
         notion_groceries_db_id=raw["NOTION_GROCERIES_DB_ID"],
         google_service_account_file=raw["GOOGLE_SERVICE_ACCOUNT_FILE"],
         google_calendar_id=raw["GOOGLE_CALENDAR_ID"],
+        openai_api_key=raw["OPENAI_API_KEY"],
+        openai_model=raw["OPENAI_MODEL"],
+        llm_daily_spend_limit_usd=floats["LLM_DAILY_SPEND_LIMIT_USD"],
         timezone=os.getenv("TIMEZONE", "").strip() or "America/New_York",
         db_path=os.getenv("DB_PATH", "").strip() or "jarvis.db",
     )

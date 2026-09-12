@@ -1,4 +1,4 @@
-"""SQLite connection. One table for now; the rest arrive with their phases."""
+"""SQLite connection and schema. Tables: messages (idempotency/undo) and llm_spend."""
 
 from __future__ import annotations
 
@@ -14,6 +14,13 @@ CREATE TABLE IF NOT EXISTS messages (
     args_json          TEXT NOT NULL,
     external_id        TEXT,
     created_at         TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS llm_spend (
+    day               TEXT PRIMARY KEY,
+    prompt_tokens     INTEGER NOT NULL,
+    completion_tokens INTEGER NOT NULL,
+    usd               REAL NOT NULL
 );
 """
 

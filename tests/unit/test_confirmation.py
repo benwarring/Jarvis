@@ -97,7 +97,7 @@ def react(payload_obj) -> None:
 
 
 def pend(*, requester_id=OWNER_ID, message_id=MESSAGE_ID, age=0.0) -> None:
-    handlers.PENDING[message_id] = (INTENT, requester_id, monotonic() - age)
+    handlers.PENDING[message_id] = ((INTENT,), requester_id, monotonic() - age)
 
 
 # --- the guards -------------------------------------------------------------
@@ -209,6 +209,28 @@ def test_a_discarded_write_records_nothing(channel, created):
 # --- expiry: yesterday's "tomorrow" is not today's ---------------------------
 
 
+def test_one_check_runs_every_write_in_a_batch(channel, created):
+    """plan.md section 4: a multi-item batch is confirmed as a unit. One ✅ means all
+    of them — if it ran only the first, the other writes would vanish silently."""
+    second = Intent("calendar.create", {"title": "optician", "when": "2026-09-09T11:00"}, "llm")
+    handlers.PENDING[MESSAGE_ID] = ((INTENT, second), OWNER_ID, monotonic())
+
+    react(payload(channel))
+
+    assert [c[0] for c in created] == ["dentist", "optician"], "all of them, in the order shown"
+    assert MESSAGE_ID not in handlers.PENDING
+
+
+def test_a_cross_on_a_batch_runs_none_of_it(channel, created):
+    """The other half of all-or-nothing."""
+    second = Intent("calendar.create", {"title": "optician", "when": "2026-09-09T11:00"}, "llm")
+    handlers.PENDING[MESSAGE_ID] = ((INTENT, second), OWNER_ID, monotonic())
+
+    react(payload(channel, emoji=CROSS))
+
+    assert created == [], "a ❌ cancels the whole batch, not just its first write"
+
+
 def test_a_stale_check_does_not_book(channel, created):
     """A pending confirmation stores the RAW "when" text and parses it at confirm
     time, so a prompt left overnight would re-resolve "tomorrow" against the click
@@ -263,7 +285,7 @@ def test_event_asks_before_it_writes(created):
     asyncio.run(handlers.confirm(interaction, INTENT))
 
     assert created == [], "a calendar write may not run before a human presses ✅"
-    assert handlers.PENDING[MESSAGE_ID][:2] == (INTENT, OWNER_ID)
+    assert handlers.PENDING[MESSAGE_ID][:2] == ((INTENT,), OWNER_ID)
     assert interaction.reactions == [CHECK, CROSS]
     assert interaction.embeds, "the user has to see what they are confirming"
 
@@ -298,23 +320,53 @@ def test_the_parked_intent_is_the_one_that_runs(channel, created):
 
 
 def test_the_embed_shows_the_title_the_time_and_the_duration():
-    embed = confirmation_embed(Intent("calendar.create", {"title": "dentist", "when": "2026-09-08T15:00"}, "slash"))
-    fields = {f.name: f.value for f in embed.fields}
-    assert embed.description == "dentist"
-    assert "03:00PM" in fields["When"], "confirming a time you cannot read is not confirming"
-    assert "60" in fields["Duration"]
+    embed = confirmation_embed((Intent("calendar.create", {"title": "dentist", "when": "2026-09-08T15:00"}, "slash"),))
+    assert embed.title == "Do this?"
+    assert "dentist" in embed.description
+    assert "03:00PM" in embed.description, "confirming a time you cannot read is not confirming"
+    assert "60 min" in embed.description
 
 
 def test_the_embed_admits_when_it_could_not_read_the_time():
-    embed = confirmation_embed(Intent("calendar.create", {"title": "dentist", "when": "soonish"}, "slash"))
-    assert "soonish" in {f.name: f.value for f in embed.fields}["When"]
+    embed = confirmation_embed((Intent("calendar.create", {"title": "dentist", "when": "soonish"}, "slash"),))
+    assert "soonish" in embed.description, "a time Jarvis could not parse must be shown, not hidden"
+
+
+def test_the_embed_shows_every_line_of_a_batch():
+    """One ✅ runs all of them, so the user has to be shown all of them."""
+    embed = confirmation_embed((
+        Intent("task.add", {"name": "floss"}, "llm"),
+        Intent("grocery.add", {"item": "milk", "qty": None}, "llm"),
+    ))
+    assert embed.title == "Do all 2?", "the count is the warning"
+    assert "floss" in embed.description and "milk" in embed.description
+    assert len(embed.description.splitlines()) == 2
 
 
 # --- the plain-message path, which now carries the new agenda intent ---------
 
 
+REPLY_ID = 888
+
+
+class FakeReply:
+    """What `message.reply` hands back: the posted message the ✅ goes onto."""
+
+    id = REPLY_ID
+
+    def __init__(self) -> None:
+        self.reactions: list[str] = []
+
+    async def add_reaction(self, emoji):
+        self.reactions.append(emoji)
+
+
 class FakeMessage:
-    """Enough of a discord.Message for `on_message`: author, channel, react, reply."""
+    """Enough of a discord.Message for `on_message`: author, channel, react, reply.
+
+    `reply` takes an embed as well as text: Layer 2 answers a read with a sentence
+    and proposes a write with the same confirmation embed `/event` uses.
+    """
 
     def __init__(self, content, *, author_id=OWNER_ID, bot=False, channel_id=CHANNEL_ID):
         self.id = 777
@@ -323,12 +375,18 @@ class FakeMessage:
         self.channel = SimpleNamespace(id=channel_id)
         self.reactions: list[str] = []
         self.replies: list[str] = []
+        self.embeds: list[object] = []
+        self.posted = FakeReply()
 
     async def add_reaction(self, emoji):
         self.reactions.append(emoji)
 
-    async def reply(self, content):
-        self.replies.append(content)
+    async def reply(self, content=None, *, embed=None):
+        if embed is not None:
+            self.embeds.append(embed)
+        else:
+            self.replies.append(content)
+        return self.posted
 
 
 def test_an_agenda_asked_in_plain_english_reads_and_replies(monkeypatch):
@@ -377,3 +435,121 @@ def test_one_owner_account_cannot_confirm_the_others_prompt(created):
     assert created == [], "the requester check still gates a second owner account"
     assert MESSAGE_ID in handlers.PENDING, "and the prompt stays live for the right account"
 
+
+
+# --- Layer 2: the fast-path miss, and the write it is allowed to PROPOSE -----
+# `Jarvis.router.llm.handle` is stubbed in every one of these: Layer 2 is the only
+# thing that costs money, and no test may spend it.
+
+
+def stub_layer2(monkeypatch, outcome):
+    """Replace the whole LLM layer. Returns the texts it was handed."""
+    seen: list[str] = []
+
+    def fake_handle(text):
+        seen.append(text)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    monkeypatch.setattr(handlers.llm, "handle", fake_handle)
+    return seen
+
+
+def test_a_fast_path_miss_falls_through_to_layer_2(monkeypatch):
+    seen = stub_layer2(monkeypatch, ("here you go.", None))
+    message = FakeMessage("ramble the regex cannot parse")
+
+    asyncio.run(handlers.on_message(message))
+
+    assert seen == ["ramble the regex cannot parse"], "the LLM gets the raw text, unmangled"
+    assert message.replies == ["here you go."]
+    assert message.reactions == [], "a sentence is its own acknowledgement"
+
+
+def test_a_fast_path_hit_never_reaches_layer_2(monkeypatch):
+    """Cost discipline: the regex answered it, so nothing may be spent on it."""
+    monkeypatch.setattr(gcal, "list_events", lambda day=None: [])
+    seen = stub_layer2(monkeypatch, ("should never happen", None))
+    message = FakeMessage("what do i have today?")
+
+    asyncio.run(handlers.on_message(message))
+
+    assert seen == [], "a parsed intent must not also buy an LLM call"
+    assert message.reactions == [CHECK]
+
+
+def test_a_non_owner_message_never_reaches_layer_2(monkeypatch):
+    """The owner check gates the spend as well as the calendar."""
+    seen = stub_layer2(monkeypatch, ("should never happen", None))
+    message = FakeMessage("anything at all", author_id=OWNER_ID + SECOND_OWNER_ID)
+
+    asyncio.run(handlers.on_message(message))
+
+    assert seen == [], "a stranger cannot make Jarvis spend money either"
+
+
+def test_a_write_the_model_proposed_is_confirmed_not_executed(monkeypatch, created):
+    """The load-bearing property at the handler: what the LLM proposes goes through
+    the SAME ✅ flow /event uses. Nothing reaches Google Calendar here."""
+    stub_layer2(monkeypatch, (INTENT,))
+    message = FakeMessage("pencil in the dentist tomorrow at 3")
+
+    asyncio.run(handlers.on_message(message))
+
+    assert created == [], "a model-parsed calendar write may not run unconfirmed"
+    assert message.embeds, "the user has to see what they are confirming"
+    assert message.replies == [], "a proposal is an embed, not a done-and-dusted sentence"
+    assert handlers.PENDING[REPLY_ID][:2] == ((INTENT,), OWNER_ID)
+    assert message.posted.reactions == [CHECK, CROSS]
+
+
+def test_the_proposed_write_runs_only_once_the_owner_checks_it(monkeypatch, created, channel):
+    """End to end: the LLM proposes, the human presses ✅, THEN the calendar moves."""
+    stub_layer2(monkeypatch, (INTENT,))
+    message = FakeMessage("pencil in the dentist tomorrow at 3")
+    asyncio.run(handlers.on_message(message))
+    assert created == []
+
+    react(payload(channel, message_id=REPLY_ID))
+
+    assert len(created) == 1 and created[0][0] == "dentist"
+
+
+def test_a_cross_on_a_proposed_write_creates_nothing(monkeypatch, created, channel):
+    stub_layer2(monkeypatch, (INTENT,))
+    asyncio.run(handlers.on_message(FakeMessage("pencil in the dentist tomorrow at 3")))
+
+    react(payload(channel, message_id=REPLY_ID, emoji=CROSS))
+
+    assert created == []
+    assert REPLY_ID not in handlers.PENDING
+
+
+def test_someone_else_cannot_confirm_a_write_the_owner_was_proposed(monkeypatch, created, channel):
+    stub_layer2(monkeypatch, (INTENT,))
+    asyncio.run(handlers.on_message(FakeMessage("pencil in the dentist tomorrow at 3")))
+
+    react(payload(channel, message_id=REPLY_ID, user_id=OWNER_ID + 1))
+
+    assert created == [], "the proposal belongs to whoever Jarvis proposed it to"
+    assert REPLY_ID in handlers.PENDING
+
+
+def test_layer_2_with_nothing_to_say_says_nothing(monkeypatch):
+    stub_layer2(monkeypatch, None)
+    message = FakeMessage("hmm")
+
+    asyncio.run(handlers.on_message(message))
+
+    assert message.replies == [] and message.embeds == [] and message.reactions == []
+
+
+def test_layer_2_blowing_up_does_not_take_the_handler_down(monkeypatch, created):
+    """Every external call is fallible; a failed one must not kill the bot process."""
+    stub_layer2(monkeypatch, RuntimeError("the LLM layer exploded"))
+    message = FakeMessage("anything")
+
+    asyncio.run(handlers.on_message(message))  # must not raise
+
+    assert created == [] and message.replies == []
