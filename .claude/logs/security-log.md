@@ -866,3 +866,270 @@ LOW spend-guard findings are worth a follow-up but do not block shipping —
 neither is the unbounded "looping API calls" failure mode the persona names,
 both are bounded, and the daily-limit design already treats overshoot as a
 soft budget rather than a hard cap.
+
+---
+
+## Phase 5 Fix Wave — verification
+
+**Date:** 2026-09-12
+**Scope:** the three Phase 5 findings' fixes and nothing else —
+`Jarvis/router/llm.py`, `Jarvis/bot/handlers.py`, `Jarvis/bot/formatting.py`,
+`Jarvis/agent/tools.py`, `tests/unit/test_llm.py`,
+`tests/unit/test_confirmation.py`. Also re-read `Jarvis/agent/manager.py` and
+the relevant `Jarvis/storage/models.py` functions (`record_message`,
+`record_llm_spend`, `spend_today`) because the batch fix's "cannot partially
+execute" claim and the spend-latch's storage boundary both depend on
+contracts those files make, not ones this wave touches. **Method:** full read
+of every listed file, hand-traced `handle`/`_run_tools`'s round loop and
+`on_raw_reaction_add`'s batch-dispatch loop statement by statement, grepped
+the tree for every call site of `complete(` and every assignment to
+`_SPEND_BLIND` to confirm each fix's mechanism has exactly one entry point,
+ran `python -m pytest tests/ -q` (465 passed, matches the brief). Per the
+brief's constraints: no git command was run, so "no assertion was weakened"
+is a static read of the current suite's rigor against what the code now
+does, not a diff against the pre-fix test file; no file under `Jarvis/` or
+`tests/` was edited, so the mutation-check spot-checks below are argued from
+tracing the stub/assertion mechanics, not from actually breaking the code and
+re-running pytest. No OpenAI call was made.
+
+### Finding-by-finding verification
+
+**1. MEDIUM — round 2 could execute a write from injected content — FIXED.**
+`router/llm.py:99`: `reply = complete(messages, TOOL_SCHEMAS if round_number
+== 0 else [])`. Grepped the whole tree for `complete(` — the OpenAI transport
+function has exactly one call site in all of `Jarvis/`; no other module
+imports and calls `integrations.llm.complete`. The conditional keys off
+`round_number == 0`, not off "the last round" or a hard-coded round count, so
+it stays correct even if `MAX_ROUNDS` is ever raised — every round after the
+first gets `[]`, not just round 2. `integrations/llm.py:76`:
+`**({"tools": tools, "tool_choice": "auto"} if tools else {})` — an empty
+list is falsy, so `[]` omits the `tools`/`tool_choice` keys from the request
+entirely (`test_complete_sends_no_tools_key_when_there_are_none`,
+`test_llm.py:524-529`), not just an empty schemas array. OpenAI's
+function-calling contract has no mechanism to return a `tool_call` for a
+request that declared no callable functions, so a tools-less round
+structurally cannot come back with anything for `_run_tools` to execute.
+Traced the injection mechanics end to end: round 0 only ever sees the system
+prompt and the owner's own message (`llm.py:88-91`), so no third-party
+content is available to act on yet; the earliest any Notion/Calendar content
+enters `messages` is the `"Tool results:\n..."` user turn appended at line
+116, and that turn is only ever read by a round that has already been
+stripped of tools. There is no other path by which tool output re-enters a
+round that has tools. Test `test_round_two_is_handed_no_tools_at_all`
+(`test_llm.py:366-380`) asserts on the literal second positional argument
+`router.complete` was called with (`seen[1][1] == []`), not on model
+behaviour a stub could fake regardless of the fix — see the mutation
+spot-check below.
+
+**2. HIGH (Standards') — multi-item batches executed unconfirmed — FIXED.**
+`bot/handlers.py:36`: `PENDING: dict[int, tuple[tuple[Intent, ...], int,
+float]]`. Traced both producers and the one consumer:
+- `confirm()` (`handlers.py:96`) wraps a single `/event` intent as
+  `(intent,)` — the slash-command path now goes through the identical
+  one-tuple-or-more shape as a Layer 2 batch, not a parallel code path.
+- `_layer2` (`handlers.py:174-176`) forwards `outcome` — already a
+  `tuple[Intent, ...]` from `router.llm.handle` — straight into `_prompt`
+  unmodified.
+- `on_raw_reaction_add` (`handlers.py:99-159`) is the only reader. Order
+  re-verified statement by statement: bot-reaction guard (110-111) → cheap
+  `PENDING.get` (115, returns early on `None` — the Cycle-2 reordering that
+  put the pending lookup before the owner check, still intact and not
+  regressed by this diff) → `is_owner(payload.user_id)` (119) → unpack →
+  requester-id match (123) → emoji filter (126) → **`del
+  PENDING[payload.message_id]` (131) — before any dispatch, exactly as
+  claimed** → TTL check (133) → CROSS branch sets a result string and
+  dispatches nothing (135-136) → CHECK branch loops `for intent in intents`
+  (140) and calls `_run(intent)` for every element, in order, before sending
+  one combined reply.
+- **Cannot partially execute:** re-read `agent/manager.py:14-36`. `dispatch()`
+  catches `NotionError`, `CalendarError`, and bare `Exception` and always
+  returns a tuple — it structurally cannot raise. Since `del PENDING[...]`
+  already happened before the loop starts, nothing (a second reaction on the
+  same message, a concurrently-scheduled task) can re-enter this batch; and
+  since `dispatch()` cannot raise, nothing inside the loop can abort it
+  partway — every intent in the tuple gets a `_run` call. The only fallible
+  per-iteration step, `record_message` (147), is wrapped in its own
+  `try/except` that logs and continues, so a bookkeeping failure on write N
+  does not stop write N+1. A ❌ never enters the loop at all (135-136), so it
+  discards the whole batch, not just the first item.
+- **held/lines logic re-derived** (`router/llm.py:156-160`):
+  `held = writes if len(writes) > 1 or any(PROPOSAL_ONLY) else ()`; whenever
+  `held` is non-empty it equals the *entire* `writes` tuple, so the filter
+  `not (held and i.name in WRITE_NAMES)` excludes every write from immediate
+  dispatch, not just some of them — no off-by-one lets a batch member slip
+  through and run early. A lone calendar write (`len(writes) == 1`) is still
+  held because it trips the `any(PROPOSAL_ONLY)` arm regardless of count;
+  a lone non-calendar write trips neither arm and runs immediately, matching
+  the fast-path's existing one-write bargain.
+- **Existing guards survived, re-confirmed by test and by reading:**
+  bot-reaction (`test_the_bots_own_check_does_not_fire_its_own_confirmation`),
+  owner (`test_a_non_owner_check_does_not_dispatch`), requester
+  (`test_a_reaction_from_someone_other_than_the_requester_does_not_dispatch`),
+  TTL (`test_a_stale_check_does_not_book` /
+  `test_a_fresh_check_still_books`), atomic delete-before-dispatch
+  (`test_a_second_check_does_not_book_the_event_twice`,
+  `test_a_check_after_a_cross_creates_nothing`), and the orphaned-`PENDING`-
+  on-failed-reaction guard
+  (`test_confirm_pops_the_entry_when_the_reaction_cannot_be_attached`) are
+  all present, all pass, and all still exercise the real guard rather than a
+  stand-in. New batch-specific coverage,
+  `test_one_check_runs_every_write_in_a_batch` (`test_confirmation.py:212-221`)
+  and `test_a_cross_on_a_batch_runs_none_of_it` (224-231), assert the full
+  ordered list of what was created / that nothing was, not just a count.
+- **Noted, not a finding:** `record_message` is `INSERT OR REPLACE` keyed on
+  `discord_message_id` (`storage/models.py:13-28`), so a confirmed batch of N
+  writes leaves only the Nth row in the local `messages` table even though
+  all N really executed against Notion/Calendar. This is the fix's own
+  disclosed limitation (`handlers.py:144-146`'s `ponytail:` comment: "a batch
+  leaves only its last write recorded ... needs its own table for ❌-undo"),
+  the same shape as the pre-existing `external_id`-is-`NULL` note from an
+  earlier pass — a Phase 9 undo built on this table must not assume one row
+  per confirmed write. No security dimension today: nothing reads this table
+  for authorization, and every write it under-records still ran behind the
+  same ✅ as every other write in its batch.
+
+**3. LOW — spend guard failed open on write — FIXED.** `router/llm.py:47`
+declares `_SPEND_BLIND = False`; `handle()` checks it as its first statement
+(`llm.py:71-73`), before the spend-counter read, before building `messages`,
+before anything else; `_record()` sets it under `except Exception` when
+`record_llm_spend` raises (`llm.py:126-132`). Grepped every reference to
+`_SPEND_BLIND` in the tree — the four production sites above and two
+test-file references, nothing else — and `handle()` is the only entry point
+into Layer 2 (`_layer2` in `bot/handlers.py` is its only caller), so there is
+no path around the check. **Cannot be bypassed:** once set, every subsequent
+`handle()` call in the same process returns `FALLBACK` before touching the
+network or the spend counter, and the only way back is the restart the
+`ponytail:` comment (`llm.py:45-46`) names. **Read side still fails closed:**
+`llm.py:76-81`'s `try: spent = spend_today(day) except Exception: ... return
+FALLBACK, None` is untouched by this diff and still covered by
+`test_a_spend_counter_that_cannot_be_read_is_treated_as_over_budget`. Both
+directions now fail closed; the asymmetry the LOW finding named is gone.
+
+### Audit of the test-authorship deviation
+
+The brief flagged that the Agent Manager both hand-verified the code and
+wrote the tests this round, so the normal writer/tester separation didn't
+hold. Checked accordingly:
+
+**Weakened assertions?** No git diff was available this pass, so this is a
+static read of the current suite's rigor, not a line-by-line diff against the
+pre-fix version. Nothing found that reads as loosened beyond the tuple
+change:
+- `test_confirmation.py`'s `PENDING[...][:2] == ((INTENT,), OWNER_ID)`-style
+  assertions slice off only the third (timestamp) field, which was already
+  unpredictable before this wave (Cycle 2 added the TTL float) — that
+  exclusion isn't new slack, it's the same necessary one as before, now
+  applied to a tuple-wrapped first element instead of a bare one.
+- The two new batch tests assert the full ordered `created` list
+  (`["dentist", "optician"]`) and an exact `created == []`, not a length
+  check or membership check that would tolerate extra or reordered writes.
+- `test_llm.py`'s batch tests
+  (`test_two_writes_in_one_reply_confirm_together`,
+  `test_a_batch_of_plain_writes_is_held_even_with_no_calendar_write`,
+  `test_a_read_alongside_a_held_write_still_runs`) each assert both halves of
+  the property — what's in the proposal AND that `dispatched` is empty (or,
+  for the read case, contains only the read) — matching the file's own
+  stated standard that a return-value-only check would pass while the model
+  silently ran a write.
+- No test was found that replaced an exact list/tuple comparison with a
+  weaker `any(...)`/`in`/length-only check where the surrounding file's own
+  established pattern uses the exact form.
+
+**`proposal()` helper — cannot silently pass on the answer arm.**
+(`test_llm.py:87-96`). Traced against the actual answer-arm shape: `handle()`
+returns `(message: str, external_id: str | None)` for anything answered
+directly. `proposal(("added floss.", None))` hits the helper's second
+assertion, `all(isinstance(i, Intent) for i in out)` — `"added floss."` is a
+`str`, so `isinstance(i, Intent)` is `False` for the first element, `all(...)`
+is `False`, and the helper raises `AssertionError: expected Intents, got
+('added floss.', None)` before returning anything. A test that calls
+`proposal()` on an answer arm fails loudly; it cannot return a hollow list
+that a later `assert [i.name for i in held] == [...]` would vacuously pass
+against. Confirmed correct.
+
+**`spend_not_blind` fixture — test hygiene, not a mask.** `_SPEND_BLIND` is a
+real one-way, process-lifetime latch by design (the `ponytail:` comment at
+`llm.py:45-46` says so explicitly, and finding 3 above is exactly "this latch
+must exist and must not be resettable in production"). pytest runs the whole
+suite in one process, so without a per-test reset, the first spend-write-
+failure test to run would latch `_SPEND_BLIND` for the rest of the session
+and every later test would silently start receiving `FALLBACK` regardless of
+its own setup — a test-ordering bug, not a production concern. Traced the
+monkeypatch mechanics: `monkeypatch.setattr(router, "_SPEND_BLIND", False)`
+runs at the start of every test (autouse) and its teardown restores the
+pre-test value, which by induction is always `False` (each prior test's
+teardown already restored it) — so a test that sets it `True` mid-body via
+`_record`'s direct module assignment gets that clobbered back to `False` at
+teardown regardless. This changes test isolation only; nothing in the
+production code path reads `monkeypatch` state. Not a mask.
+
+**Mutation-check spot-check, as requested.**
+- *Round-2 fix* (`router/llm.py:99`): mutating the guard to always pass
+  `TOOL_SCHEMAS` (dropping the `if round_number == 0 else []`) would make
+  `router.complete`'s second call receive `tools.TOOL_SCHEMAS` instead of
+  `[]`. `stub_complete`'s fake records the literal argument it was called
+  with (`test_llm.py:43-44`: `seen.append((messages, tool_schemas))`)
+  independent of what the model "does" with it, so `seen[1][1]` would become
+  a non-empty list and `test_round_two_is_handed_no_tools_at_all`'s
+  `assert seen[1][1] == []` (`test_llm.py:380`) would fail directly, on the
+  exact value the mutation changes. Claim holds — verified by tracing the
+  stub's recording mechanism against the assertion; not executed, per the
+  no-file-edits constraint.
+- *Spend-latch fix* (`router/llm.py:71-73` and `126-132`): removing the
+  `_SPEND_BLIND = True` assignment inside `_record`'s except block would
+  leave `router._SPEND_BLIND` at `False` after the first call in
+  `test_a_failed_spend_write_shuts_layer_2_until_restart`, failing
+  `assert router._SPEND_BLIND is True` (`test_llm.py:359`) immediately.
+  Removing instead the `if _SPEND_BLIND:` consultation at the top of
+  `handle()` (`llm.py:71-73`) — leaving the latch set but never checked —
+  would let the test's second call, `router.handle("second")`, fall through
+  past that line. Confirmed this isn't independently masked by the real
+  spend-limit check: `spend_today` is not stubbed in this test and
+  `record_llm_spend` never succeeds, so the counter stays `0.0`, and
+  `FAKE_ENV`'s `LLM_DAILY_SPEND_LIMIT_USD` is `"1.00"` (`conftest.py:56`) —
+  `0.0 >= 1.00` is false, so the limit check would not itself block the call
+  and mask the mutation. The call then reaches `complete()`, which the test
+  has repointed to `raises(AssertionError("spent while blind"))`
+  (`test_llm.py:362`). That `AssertionError` is not an `LLMError`, so
+  `handle()`'s `except LLMError` (`llm.py:100`) does not catch it; it
+  propagates out of `router.handle(...)` and the test errors out on line 363
+  instead of completing the comparison — a failing test either way. Both
+  mutations are caught by the named test.
+
+### New findings
+
+None at MEDIUM or above. One informational note, already covered under
+finding 2: a confirmed batch of N writes leaves only the last one recorded in
+the local `messages` table (an `INSERT OR REPLACE` keyed on the Discord
+message id) — disclosed by the fix's own comment, no security dimension
+today, worth remembering when Phase 9's undo is designed so it doesn't assume
+one row per confirmed write.
+
+### Verdict
+
+**Can someone else access my personal information?** No change from Phase
+5's own verdict — nothing in this fix wave touches the owner allowlist, and
+re-reading `on_message`/`on_raw_reaction_add` end to end found the Cycle-2
+check ordering (pending lookup before owner check) intact.
+
+**Can anyone else make calls to Jarvis?** No. Unchanged from Phase 5; this
+wave's changes are entirely about *what* an already-owner-gated call is
+allowed to execute unconfirmed, not about *who* can reach the code.
+
+**Is Layer 2 now safe against Notion content a third party can write?** Yes,
+for the specific mechanism the Phase 5 MEDIUM found: round 2 is structurally
+incapable of calling a tool (no schemas reach the API call, and OpenAI's
+function-calling contract cannot return a `tool_call` for functions it was
+never told about), so injected content read back from a list can at most
+change round 2's *prose*, never trigger a second write. Combined with the
+batch fix, the two remaining ways a write reaches Notion/Calendar without a
+fresh human decision are: (a) a lone, non-calendar write decided in round 0 —
+the same one-write-per-message bargain the regex fast-path already makes on
+the owner's own, uninjected message text, and (b) a confirmed ✅ on a batch
+the owner reviewed in full beforehand. Neither is reachable by third-party
+Notion content, because round 0 never sees any content but the system prompt
+and the owner's own message. Of the two Phase 5 LOW spend-guard findings: the
+write-side fail-open is fixed by this wave; the check-then-record TOCTOU race
+under concurrent messages was out of this wave's scope and was not
+re-examined here — it remains open, bounded, and previously assessed as not
+blocking.

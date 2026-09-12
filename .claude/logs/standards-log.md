@@ -903,3 +903,357 @@ schema/tool coupling, the allowlist on tool names and arguments, and the
 proposal-only gate for calendar writes specifically) is solid and gives
 Phase 6 a correct foundation to build the "one LLM call, deterministic
 fallback on failure" pattern plan.md §5a already commits to.
+
+---
+
+# Phase 5 Fix Wave — verification — 2026-09-12
+
+Scope: verifying the fix wave that closes my own H1 (multi-item batches from
+Layer 2 executing unconfirmed), plus the two items from the same finding
+(round 2's tool schemas, the spend-write latch) and plan conformance for both
+sections named in the brief. Read fresh: `router/llm.py`, `bot/handlers.py`,
+`bot/formatting.py`, `agent/tools.py`, `agent/manager.py`, `router/intents.py`,
+`storage/db.py`, `storage/models.py`, `plan/plan.md` §4 and §6, and both
+`tests/unit/test_llm.py` and `tests/unit/test_confirmation.py` in full. Ran
+`python -m pytest tests/ -q`: **465 passed**, 0 failed. No OpenAI call made,
+`.env`/`secrets/` untouched, no git command run, and — per this review's own
+constraint — nothing under `Jarvis/` or `tests/` was edited; the only write is
+this entry.
+
+Also noted for the record: this fix wave was implemented and its tests
+written by the same actor (the Agent Manager, hand-verifying code after the
+fix agent hit a spend limit), so the normal write/test separation didn't hold
+this round. The brief asks me to audit that specifically; see "Test-change
+audit" below.
+
+## H1 — RESOLVED
+
+Evidence, traced end to end rather than taken on the diff's word:
+
+- **`PENDING` is now keyed to a tuple.** `Jarvis/bot/handlers.py:36`:
+  `dict[int, tuple[tuple[Intent, ...], int, float]]`. A comment at lines 34-35
+  states the intent plainly ("one write, or the whole batch... confirmed
+  together"), and it holds — see the single expression below.
+- **One decision computes both the calendar case and the batch case.**
+  `Jarvis/router/llm.py:156-157`:
+  ```python
+  writes = tuple(i for i in intents if i.name in WRITE_NAMES)
+  held = writes if len(writes) > 1 or any(i.name in PROPOSAL_ONLY for i in writes) else ()
+  ```
+  `held` is always either *all* of `writes` or *none* of it — there is no
+  partial-hold state, so the exclusion filter two lines down
+  (`if not (held and i.name in WRITE_NAMES)`) cannot accidentally let one
+  write in a held batch slip through while blocking another. A lone
+  non-calendar write (`len(writes) == 1`, not in `PROPOSAL_ONLY`) is the only
+  case that dispatches immediately — matching the fast-path's existing
+  one-write-per-message bargain, as the docstring at lines 139-144 claims.
+  `calendar.create` is held at count 1 too, via the `any(... PROPOSAL_ONLY
+  ...)` arm — confirmed by
+  `test_a_model_proposed_calendar_write_is_handed_back_not_dispatched`.
+- **`WRITE_NAMES` exists and is exactly what it should be.**
+  `Jarvis/agent/tools.py:188-190`: the five actual writes
+  (`grocery.add`, `grocery.check`, `task.add`, `task.complete`,
+  `calendar.create`) — reads are excluded on purpose, and that's not just
+  claimed, it's checked: `assert not WRITE_NAMES & {"grocery.list",
+  "task.list", "calendar.agenda"}` runs in `tools.py`'s own `__main__`
+  self-check (line 292), and `assert PROPOSAL_ONLY <= WRITE_NAMES <=
+  set(TOOLS)` runs unconditionally at import time via `_check_schemas()`
+  (line 276, called at line 286). A drifted set here would fail on the next
+  test run, not just look wrong on inspection.
+- **The confirmation mechanism itself did not fork.** `_prompt`
+  (`Jarvis/bot/handlers.py:62-85`) takes `intents: tuple[Intent, ...]`
+  unconditionally; `confirm()` (line 96) wraps a single slash-command intent
+  in a 1-tuple before calling it, `_layer2()` (line 175) passes Layer 2's
+  tuple straight through. `on_raw_reaction_add` (lines 138-149) loops over
+  whatever tuple it finds and runs every entry — a 1-tuple loops once. I
+  grepped the whole tree for other consumers of `PROPOSAL_ONLY`/`WRITE_NAMES`
+  and for any other `len(...)`-gated branch near this code (see "genuinely
+  one path" below) and found none.
+- **465/465 tests pass**, including four new/adapted `test_llm.py` cases that
+  exercise exactly this decision from the outside
+  (`test_two_writes_in_one_reply_confirm_together`,
+  `test_a_batch_of_plain_writes_is_held_even_with_no_calendar_write`,
+  `test_a_lone_write_still_runs_without_asking`,
+  `test_a_read_alongside_a_held_write_still_runs`), plus two new
+  `test_confirmation.py` cases exercising the handler side
+  (`test_one_check_runs_every_write_in_a_batch`,
+  `test_a_cross_on_a_batch_runs_none_of_it`). All assert on `dispatched`/
+  `created` — the actual side effect — not on a return value, consistent with
+  this file's own stated bar.
+
+**Verdict: H1 is closed, correctly, at the root.** The fix is one arithmetic
+decision (`held`) consumed by one execution filter and one confirmation
+mechanism, not a batch-shaped patch bolted alongside the old single-intent
+path.
+
+## Judging the fix, not just its presence (item 1's four questions)
+
+**Is this genuinely one code path, or a second one in disguise?** One path.
+I grepped for every count-based branch touching this feature
+(`len(intents)`, `len(held)`, `len(writes)`, `len(proposals)`) across all of
+`Jarvis/` and found exactly two hits in the whole tree: the `held =`
+assignment above, and `Jarvis/bot/formatting.py:43`
+(`title="Do this?" if len(intents) == 1 else f"Do all {len(intents)}?"`) —
+a cosmetic string choice, not a structural fork. `Jarvis/agent/manager.py`'s
+`dispatch()` (unchanged by this fix wave, read in full) has zero knowledge of
+confirmation policy — it is exactly as dumb as it was before H1, taking one
+`Intent` and running it. The policy — what needs a ✅ — lives in exactly one
+place, `router/llm.py`'s `_run_tools`. That is the definition of one path.
+
+**Is `WRITE_NAMES` in the right module?** Yes. It sits in `Jarvis/agent/tools.py`
+next to `PROPOSAL_ONLY`, which this review's own Phase-5 pass already judged
+correctly placed there (Cycle-2/Phase-5 findings, "one implementation per
+capability," item 2). Both constants are properties of the tool *registry* —
+which tools mutate state, which of those are calendar-risky enough to always
+hold — not of the router consuming them. `router/llm.py` imports both
+(`line 21`); nothing in `agent/tools.py` imports anything from `router/`, so
+the plan §3 dependency arrow (`bot -> agent -> router -> integrations`) isn't
+touched by where this metadata lives — `router` reading a constant out of
+`agent` is the same direction the file already reads `TOOL_SCHEMAS` and
+`LLM_NAMES` from, not a new one.
+
+**Does `confirmation_embed` read well for both a single write and a batch, or
+has the single case regressed?** No regression, and the reason is worth
+stating plainly: the single-write case was *always* `calendar.create`, both
+before and after this fix. I checked every slash command
+(`Jarvis/bot/commands/{todo,grocery,agenda,event}.py`): only `event.py` calls
+`confirm()`; `todo.py` and `grocery.py`'s adds/completes call `respond()`,
+which dispatches immediately and never reaches `confirmation_embed` at all.
+So the lone-item branch of `confirmation_embed` was never rendering a plain
+Notion write pre-fix, and still isn't — the function's single-item input
+shape hasn't changed, only its rendering (fields -> one joined description
+string) and the fact that it can now also be handed 2+ items. The rendering
+itself (`Jarvis/bot/formatting.py:21-31`, `_line`) still special-cases
+`calendar.create` with a proper title/time/duration line, and falls back to
+`f"**{intent.name}** - " + ", ".join(...)` for anything else — used for the
+first time in a batch, since a lone non-calendar write never reaches this
+function. That generic line is honestly plain (`"**task.add** - floss"`
+rather than "Add task: floss"), but it's the disclosed kind of plain — the
+comment at lines 28-30 names the tradeoff and its trigger ("Prettify it when
+a line actually reads badly to the user") rather than hiding it. Not a
+regression; a minor cosmetic rough edge on genuinely new code, correctly
+flagged in-line. `test_the_embed_shows_every_line_of_a_batch` exercises this
+exact generic branch (`task.add`/`grocery.add`, neither is `calendar.create`)
+and checks an exact line count (`len(embed.description.splitlines()) == 2`),
+which is a stronger assertion than "the words appear somewhere."
+
+## Item 2 — round 2 handed `[]` instead of `TOOL_SCHEMAS` — RESOLVED
+
+`Jarvis/router/llm.py:99`: `complete(messages, TOOL_SCHEMAS if round_number ==
+0 else [])`. The comment above it (lines 94-97) names the actual threat
+correctly — round 1's tool output is replayed as a plain user turn, and that
+text can carry a Notion title written by anyone with database access, so
+leaving tools attached on round 2 would let a crafted title talk the model
+into an unconfirmed write. `test_round_two_is_handed_no_tools_at_all`
+(`test_llm.py:366-380`) asserts `seen[1][1] == []` directly against the
+captured call, not against behavior that would only indirectly imply it.
+
+## Item 3 — `_SPEND_BLIND` latch — RESOLVED
+
+`Jarvis/router/llm.py:47` declares the module-level flag with a `ponytail:`
+comment naming its ceiling (in-memory, one-way, reset by restart) and why
+that's sufficient (a retry or N-consecutive-failure count "would buy nothing
+a restart does not"). `handle()` checks it first, before even the spend read
+(lines 71-73); `_record()` sets it on a failed write (lines 126-133), with a
+comment explaining the asymmetry it closes: reads already failed closed
+(an unreadable counter refuses service), but a failed *write* previously left
+the counter frozen while Layer 2 kept spending against it — unbounded and
+invisible. `test_a_failed_spend_write_shuts_layer_2_until_restart`
+(`test_llm.py:346-363`) proves both halves: the call that fails to record
+still answers the user (billing is best-effort), and the *next* call is
+refused before any request goes out, backed by a transport stub that raises
+`AssertionError` if it's invoked at all. The autouse `spend_not_blind`
+fixture (`test_llm.py:75-84`) resets the module global per test, with a
+comment correctly distinguishing "test isolation" from "fixing the module" —
+latching for the life of the process is the point.
+
+## Plan conformance (item 4)
+
+**§4's confirmation wording.** "Calendar writes and any multi-item batch
+render as an embed with ✅/❌ reactions before executing. Reads execute
+immediately." (`plan/plan.md:213-214`) — this is not contradicted by the
+code; it's a two-category enumeration (calendar writes, batches) and the
+code implements exactly those two plus one uncontested default (a lone
+non-calendar write runs, which is the complement of both named categories,
+not a third category the plan forgot). CLAUDE.md's own wording ("Calendar
+writes and multi-item batches require ✅ confirmation before executing") draws
+the identical boundary. **Ruling: no move required.** Both governing
+documents are consistent with the code as built. The one thing I'd still do
+opportunistically (not blocking, not a finding) is add a half-sentence
+spelling out the third case explicitly, since `router/llm.py`'s own comments
+already articulate the "matches the fast-path's bargain" rationale better
+than the plan does — a future reader of §4 alone wouldn't get that
+justification without reading the code.
+
+**§6's `messages` table vs. the batch-recording `ponytail:` note — new
+finding, see FW-M1 below.** This one *is* a real divergence, and it's
+new — introduced by this fix wave's own mechanism, not a pre-existing gap.
+
+## New findings
+
+### MEDIUM
+
+**FW-M1 — A confirmed batch leaves only its last write in the `messages`
+table; `plan.md` §6 still promises the table "powers undo and idempotency"
+without qualification.**
+`Jarvis/storage/db.py:12`: `discord_message_id INTEGER PRIMARY KEY`.
+`Jarvis/storage/models.py:19-20`: `record_message` is `INSERT OR REPLACE`
+keyed on that column. `Jarvis/bot/handlers.py:138-149`:
+```python
+for intent in intents:
+    line, external_id = await _run(intent)
+    lines.append(line)
+    try:
+        # ponytail: one row per Discord message id (it is the primary key), so
+        # a batch leaves only its last write recorded. Fine while the row is
+        # just idempotency bookkeeping; needs its own table for ❌-undo.
+        record_message(payload.message_id, intent.name, intent.args, external_id)
+    except Exception:
+        log.exception("Couldn't record confirmed %s", intent.name)
+```
+This loop calls `record_message` once per intent in the batch, every call
+keyed by the *same* `payload.message_id`. Because that column is the primary
+key and the write is `INSERT OR REPLACE`, each call overwrites the last —
+after a 3-write batch confirms, `find_message(payload.message_id)` returns
+only the third write's `(intent, args, external_id)`. The other two writes
+genuinely happened (Notion/GCal both got real rows/events — nothing is lost
+*there*), but the local bookkeeping table plan.md §6 describes as powering
+"undo and idempotency" (`plan/plan.md:304`) cannot recover them. This is
+**not a pre-existing condition** — before this fix wave, `PENDING` held one
+`Intent`, so this loop ran exactly once per confirmation and the overwrite
+scenario could not arise; generalizing `PENDING` to a tuple is what makes
+one message id correspond to N writes for the first time.
+
+The comment is honest and correctly named (both the ceiling and the upgrade
+path, per this codebase's own `ponytail:` convention), which is why this
+isn't rated HIGH — nothing breaks today, since nothing currently reads
+`messages` at runtime to gate behavior (`find_message` is called only from
+tests; grepped to confirm). But two things are missing that CLAUDE.md's own
+rule calls for: (1) `plan.md` §6 was not updated in the same commit to
+mention the limitation the code itself now documents — a reader of the plan
+alone would believe every write in a confirmed batch is individually
+recoverable, and it isn't; (2) no test locks in or even exercises this
+behavior — `test_one_check_runs_every_write_in_a_batch` checks `created`
+(what reached Google Calendar) but never calls `find_message` afterward, so
+there is nothing that would fail if the overwrite got worse (e.g., silently
+started raising, or started recording the *first* write instead of the last,
+which would be a strictly worse bug for idempotency-on-redelivery).
+
+**Fix:** add a clause to §6's `messages` row along the lines of "one row per
+Discord message id; a confirmed batch (§4) currently keeps only its last
+write — the earlier ones still land in Notion/GCal, just without local
+idempotency/undo bookkeeping. A real fix needs one row per intent (or a JSON
+list column) and is deferred to Phase 9's undo work, which needs that
+restructuring anyway." This is the same style of disclosure this review
+already approved for M5's `Project` column — document the gap where the plan
+makes the promise, rather than silently letting the plan overclaim. Not
+blocking Phase 6, which never touches `messages`.
+
+### LOW
+
+**FW-L1 — `_line`'s generic (non-calendar) rendering in a batch is honestly
+plain, not polished.** `Jarvis/bot/formatting.py:31`: a batch line for e.g.
+`task.add` reads `"**task.add** - floss"` — the raw dotted registry name, not
+"Add task: floss." Already covered above under item 1's embed question;
+listed here only so it's tracked as a named, low-priority item rather than
+folded silently into the H1 verdict. The comment at `formatting.py:28-30`
+already names the tradeoff and the trigger for revisiting it ("when a line
+actually reads badly to the user") — no action needed unless that trigger
+fires.
+
+## Test-change audit (write/test separation was off this round)
+
+Checked the two specific claims in the brief against the actual assertions,
+not against the fact that tests exist and pass.
+
+**The two replaced `test_llm.py` tests.** Grepped for the old names
+(`test_a_proposal_stops_everything_after_it_in_the_same_reply`,
+`test_a_tool_before_a_proposal_still_runs`) — zero hits anywhere in `tests/`,
+confirming they're gone, not renamed-with-old-bodies. Their old claims don't
+translate 1:1 to the new design because the property they tested no longer
+exists in this shape: the old loop dispatched in order and stopped the
+instant it hit a proposal, so "stops everything after it" and "a tool before
+it still runs" were both about *position within the call list*. The new
+`_run_tools` (`router/llm.py:146-161`) builds the full `intents` list first
+with no early return, then partitions by write/read membership — position is
+structurally irrelevant, which I confirmed by reading the filter
+(`if not (held and i.name in WRITE_NAMES)`) rather than assuming it: nothing
+in it, or in the loop building `intents`, branches on index or order.
+Given that, the replacement tests cover the *successor* properties correctly:
+`test_a_read_alongside_a_held_write_still_runs` proves a call earlier in the
+list (`list_tasks`) still runs when a later call is held — direct
+successor to "a tool before a proposal still runs." No replacement directly
+puts a read *after* a proposal in the call order, but since the code has no
+order-dependent branch at all (verified by inspection, not assumed), a
+mirrored test would exercise the identical code path and add no coverage —
+this is a non-gap, not an overlooked one. `test_two_writes_in_one_reply_confirm_together`
+and `test_a_batch_of_plain_writes_is_held_even_with_no_calendar_write` are
+net-new coverage for a property the old tests couldn't have expressed at all
+(batching), so the replacement set is broader than the pair it replaced, not
+narrower. **No case was quietly dropped.**
+
+**The embed tests (fields -> description).** `test_the_embed_shows_the_title_the_time_and_the_duration`
+and `test_the_embed_admits_when_it_could_not_read_the_time` check substring
+containment in `embed.description` where a fields-based version would have
+checked `embed.fields[n].value` — a different shape, not a lower bar, since
+both still pin the three facts that matter (title text, a correctly-rendered
+time, the duration) and the parse-failure fallback text. The genuinely new
+`test_the_embed_shows_every_line_of_a_batch` is, if anything, stricter than
+what a single-item fields test could have been: it pins an exact line count
+(`len(embed.description.splitlines()) == 2`), which would fail on a stray
+blank line or an accidental header — a category of bug a fields-based test
+has no equivalent way to catch. **No assertion here reads as weakened.**
+
+**General sweep for quietly-loosened assertions.** Read every test in both
+files top to bottom (not just the ones the brief named). All of the
+pre-existing single-intent tests in `test_confirmation.py`
+(`test_the_bots_own_check_does_not_fire_its_own_confirmation` through
+`test_a_fresh_check_still_books`) were adapted mechanically — the `pend()`
+helper (`test_confirmation.py:99-100`) now wraps `INTENT` in a 1-tuple, but
+every assertion downstream of it is untouched (`created[0][0] == "dentist"`,
+`MESSAGE_ID not in handlers.PENDING`, etc.) — this is exactly the "shape
+change forces a mechanical edit" case CLAUDE.md's own conventions would
+expect, not a place where scrutiny was softened. Nothing in either file
+asserts a weaker property than the finding it closes; several of the new
+tests (the exact-line-count embed check, the `AssertionError`-not-`LLMError`
+transport stub reused from the pre-existing spend tests) are stricter than
+the median test already in the file. **Verdict: the test changes hold up.**
+I would have signed off on this file as the test-writing subagent.
+
+## Verdict on the four review questions
+
+1. **Unnecessarily repeated blocks of code?** None. The fix adds one
+   constant (`WRITE_NAMES`), one arithmetic line (`held =`), and generalizes
+   existing functions to take a tuple instead of a single `Intent` — no
+   parallel implementation of the confirmation flow was created anywhere.
+2. **Helper-function use / modularity?** Yes. `_prompt` remains the single
+   shared confirmation door for both callers; the write/proposal
+   classification lives in exactly one file (`agent/tools.py`) and is
+   consumed from exactly one other file (`router/llm.py`); `_check_schemas()`
+   was correctly extended with two new assertions
+   (`PROPOSAL_ONLY <= WRITE_NAMES <= set(TOOLS)`, and the reads-are-not-writes
+   check in `__main__`) rather than left to drift silently.
+3. **Does the code do what it promises?** Yes. H1's exact promise — a batch
+   confirms together, a calendar write always confirms, a lone non-calendar
+   write doesn't — is implemented as one decision and tested from both the
+   router side and the handler side. The one promise that's now measurably
+   not quite kept is the `messages` table's "idempotency and undo" claim for
+   the batch case (FW-M1), which is a plan/code gap, not a broken feature.
+4. **Does the project match the plan?** Yes for §4 (no move needed, see
+   above); not yet for §6, where FW-M1 is a real, dated, and — per CLAUDE.md's
+   own rule — overdue plan edit that should have shipped in this same fix
+   wave.
+
+## Phase-6 readiness
+
+**Clear to start.** H1 is closed at the root, with a single decision point
+and no disguised second path; items 2 and 3 are both confirmed fixed with
+tests that would fail if either regressed; 465/465 tests pass. The one new
+finding (FW-M1) is a MEDIUM documentation gap in a table Phase 6 (the daily
+brief) never reads or writes — grepped `scheduler/` and confirmed it doesn't
+exist yet, so there's nothing for Phase 6 to inherit here. The test-change
+audit found no weakened assertions and no quietly-dropped case; the
+write/test separation being off this round did not produce a worse outcome
+than the normal process would have. Fix FW-M1's plan edit whenever `messages`
+is next touched — ideally before Phase 9 (undo) starts, since that phase is
+exactly where the gap stops being free.

@@ -301,7 +301,7 @@ Category is auto-assigned by the fast-path from a static keyword map
 
 | Table | Purpose |
 |---|---|
-| `messages` | Discord message ID -> resolved intent -> resulting Notion/GCal ID. Powers undo and idempotency |
+| `messages` | Discord message ID -> resolved intent -> resulting Notion/GCal ID. Powers idempotency. **Not yet sufficient for undo:** the Discord message id is the primary key, so a confirmed multi-write batch (Layer 2 can propose one) overwrites its own row and only the last write survives. Phase 9 needs a row per write before ❌-undo can be honest |
 | `briefs` | One row per generated brief; prevents double-posting after a restart |
 | `reminders_fired` | One row per delivered reminder; prevents double-notifying after a restart |
 | `weather_cache` | One row per day; keeps the morning fetch serving `/weather` all day |
@@ -452,7 +452,7 @@ Each phase also ends with a §9 review pass.
 | **6** | Daily brief | Task Scheduler posts to `#daily-brief` at 07:00; `/brief` on demand |
 | **7** | Weather | Provider chosen, credential added, `/weather` works, brief header line lands |
 | **8** | Reminders | Appointment lead-time pings and task nudges, idempotent across restart |
-| **9** | Hardening | Retries with backoff, rate-limit handling, errors to `#logs`, undo via ❌, spend guard |
+| **9** | Hardening | Retries with backoff, rate-limit handling, errors to `#logs`, undo via ❌ (needs the `messages` rework in §6 first — one row per write, not per Discord message), spend guard (already built in Phase 5) |
 | **10** | Portability | Dockerfile + documented VPS deploy, so the laptop stops being load-bearing |
 
 Unit tests (§8) are written alongside each phase, not batched at the end. The
