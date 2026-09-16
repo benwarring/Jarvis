@@ -273,6 +273,21 @@ LLM call — the trigger is a timestamp comparison and the message is a template
 
 ### Notion — Tasks database
 
+Property names are declared once as constants at the top of `integrations/notion.py`
+rather than inline at each call site. The live database is the authority, not this
+table: rename a property in Notion and exactly one line changes in the code.
+
+Two API facts that cost an afternoon, recorded so they do not cost another:
+
+- **Addressing is by *data source* ID, not database ID.** Notion's current API puts one
+  or more data sources under a database, and reads and writes address the data source.
+  The ID in a Notion URL is not it, and the failure says "is a page, not a database".
+  `SETUP.md` §3e has the query that lists the real IDs.
+- **`databases.query` no longer exists**; it is `data_sources.query`, and a page is
+  created with `parent={"data_source_id": ...}`. Unit tests stub at the
+  `integrations/` boundary, so they cannot catch this class of breakage — only the §8
+  functional tier can.
+
 | Property | Type | Notes |
 |---|---|---|
 | `Name` | Title | The task |

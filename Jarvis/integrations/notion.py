@@ -122,6 +122,27 @@ def _date(props: dict[str, Any], key: str) -> datetime | None:
     return to_local(parsed)
 
 
+# --- property names ---------------------------------------------------------
+#
+# Notion property names are data, not code. These match plan.md section 6, but the
+# live database is the authority: renaming a property in Notion breaks every call
+# that hard-codes it. They live here, once, rather than sprinkled through the
+# functions below, so a rename in Notion is a one-line change here.
+
+TASK_TITLE = "Name"
+TASK_DUE = "Due"
+TASK_STATUS = "Status"
+TASK_PRIORITY = "Priority"
+TASK_ESTIMATE = "Estimate"
+TASK_NOTES = "Notes"
+TASK_SOURCE = "Source"
+
+GROCERY_TITLE = "Item"
+GROCERY_QTY = "Qty"
+GROCERY_CATEGORY = "Category"
+GROCERY_GOT = "Got it"
+
+
 # --- tasks ------------------------------------------------------------------
 
 
@@ -134,22 +155,22 @@ def add_task(
     notes: str | None = None,
 ) -> str:
     props: dict[str, Any] = {
-        "Name": {"title": [{"text": {"content": name}}]},
-        "Source": {"select": {"name": "discord"}},
+        TASK_TITLE: {"title": [{"text": {"content": name}}]},
+        TASK_SOURCE: {"select": {"name": "discord"}},
     }
     if due is not None:
-        props["Due"] = {"date": {"start": to_local(due).isoformat()}}
+        props[TASK_DUE] = {"date": {"start": to_local(due).isoformat()}}
     if priority:
-        props["Priority"] = {"select": {"name": priority}}
+        props[TASK_PRIORITY] = {"select": {"name": priority}}
     if estimate is not None:
-        props["Estimate"] = {"number": estimate}
+        props[TASK_ESTIMATE] = {"number": estimate}
     if notes:
-        props["Notes"] = {"rich_text": [{"text": {"content": notes}}]}
+        props[TASK_NOTES] = {"rich_text": [{"text": {"content": notes}}]}
 
     page = _call(
         "add that task",
         _client().pages.create,
-        parent={"database_id": get_config().notion_tasks_db_id},
+        parent={"data_source_id": get_config().notion_tasks_db_id},
         properties=props,
     )
     return page["id"]
@@ -158,19 +179,19 @@ def add_task(
 def list_open_tasks(limit: int = 25) -> list[Task]:
     result = _call(
         "read your tasks",
-        _client().databases.query,
-        database_id=get_config().notion_tasks_db_id,
-        filter={"property": "Status", "status": {"does_not_equal": "Done"}},
+        _client().data_sources.query,
+        data_source_id=get_config().notion_tasks_db_id,
+        filter={"property": TASK_STATUS, "status": {"does_not_equal": "Done"}},
         page_size=limit,
     )
     tasks = [
         Task(
             id=row["id"],
-            name=_title(row["properties"], "Name"),
-            status=_select(row["properties"], "Status") or "Not started",
-            due=_date(row["properties"], "Due"),
-            priority=_select(row["properties"], "Priority"),
-            estimate=(row["properties"].get("Estimate") or {}).get("number"),
+            name=_title(row["properties"], TASK_TITLE),
+            status=_select(row["properties"], TASK_STATUS) or "Not started",
+            due=_date(row["properties"], TASK_DUE),
+            priority=_select(row["properties"], TASK_PRIORITY),
+            estimate=(row["properties"].get(TASK_ESTIMATE) or {}).get("number"),
         )
         for row in result["results"]
     ]
@@ -191,7 +212,7 @@ def _set_property(what: str, page_id: str, prop: dict[str, Any]) -> None:
 
 
 def complete_task(page_id: str) -> None:
-    _set_property("close that task", page_id, {"Status": {"status": {"name": "Done"}}})
+    _set_property("close that task", page_id, {TASK_STATUS: {"status": {"name": "Done"}}})
 
 
 # --- groceries --------------------------------------------------------------
@@ -199,17 +220,17 @@ def complete_task(page_id: str) -> None:
 
 def add_grocery(item: str, *, qty: str | None = None, category: str | None = None) -> str:
     props: dict[str, Any] = {
-        "Item": {"title": [{"text": {"content": item}}]},
-        "Category": {"select": {"name": category or categorize(item)}},
-        "Got it": {"checkbox": False},
+        GROCERY_TITLE: {"title": [{"text": {"content": item}}]},
+        GROCERY_CATEGORY: {"select": {"name": category or categorize(item)}},
+        GROCERY_GOT: {"checkbox": False},
     }
     if qty:
-        props["Qty"] = {"rich_text": [{"text": {"content": qty}}]}
+        props[GROCERY_QTY] = {"rich_text": [{"text": {"content": qty}}]}
 
     page = _call(
         "add that item",
         _client().pages.create,
-        parent={"database_id": get_config().notion_groceries_db_id},
+        parent={"data_source_id": get_config().notion_groceries_db_id},
         properties=props,
     )
     return page["id"]
@@ -218,25 +239,25 @@ def add_grocery(item: str, *, qty: str | None = None, category: str | None = Non
 def list_groceries(limit: int = 50) -> list[Grocery]:
     result = _call(
         "read your grocery list",
-        _client().databases.query,
-        database_id=get_config().notion_groceries_db_id,
-        filter={"property": "Got it", "checkbox": {"equals": False}},
+        _client().data_sources.query,
+        data_source_id=get_config().notion_groceries_db_id,
+        filter={"property": GROCERY_GOT, "checkbox": {"equals": False}},
         page_size=limit,
     )
     return [
         Grocery(
             id=row["id"],
-            item=_title(row["properties"], "Item"),
-            qty=_text(row["properties"], "Qty"),
-            category=_select(row["properties"], "Category"),
-            got_it=bool((row["properties"].get("Got it") or {}).get("checkbox")),
+            item=_title(row["properties"], GROCERY_TITLE),
+            qty=_text(row["properties"], GROCERY_QTY),
+            category=_select(row["properties"], GROCERY_CATEGORY),
+            got_it=bool((row["properties"].get(GROCERY_GOT) or {}).get("checkbox")),
         )
         for row in result["results"]
     ]
 
 
 def check_off_grocery(page_id: str) -> None:
-    _set_property("check that item off", page_id, {"Got it": {"checkbox": True}})
+    _set_property("check that item off", page_id, {GROCERY_GOT: {"checkbox": True}})
 
 
 def categorize(item: str) -> str:
