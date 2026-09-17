@@ -139,6 +139,57 @@ def create_event(
     )
 
 
+def free_slots(
+    events: list[Event],
+    day: date,
+    *,
+    start_hour: int,
+    end_hour: int,
+    min_minutes: int,
+) -> list[tuple[datetime, datetime]]:
+    """Free gaps inside one LOCAL day's waking window. Pure: no network, no config.
+
+    Interval arithmetic, in three moves: clip every event to the window, merge what
+    overlaps, then walk the merged blocks and keep what is left over. Takes events
+    rather than fetching them, so the caller reads the day ONCE and the agenda and the
+    gaps cannot disagree — and so the six edge cases plan.md section 8 names are
+    testable without a calendar at all.
+    """
+    # Naive local wall time -> UTC. end_hour may be 24, which time(24) cannot express,
+    # so the window is built by adding hours to local midnight.
+    midnight = datetime.combine(day, time.min)
+    window_start = to_utc(midnight + timedelta(hours=start_hour))
+    window_end = to_utc(midnight + timedelta(hours=end_hour))
+    floor = timedelta(minutes=min_minutes)
+
+    # Clip, not discard: an event overhanging either edge still blocks the part inside.
+    # An event wholly outside collapses to start >= end here and drops out.
+    busy = sorted(
+        (max(e.start, window_start), min(e.end, window_end))
+        for e in events
+        if max(e.start, window_start) < min(e.end, window_end)
+    )
+
+    # Merge before subtracting, or a meeting nested inside another leaves a phantom gap
+    # running backwards. <= also merges back-to-back blocks, which have no gap anyway.
+    merged: list[list[datetime]] = []
+    for start, end in busy:
+        if merged and start <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+
+    gaps: list[tuple[datetime, datetime]] = []
+    cursor = window_start
+    for start, end in merged:
+        if cursor < start and start - cursor >= floor:  # >= keeps a gap exactly at the floor
+            gaps.append((cursor, start))
+        cursor = end
+    if cursor < window_end and window_end - cursor >= floor:
+        gaps.append((cursor, window_end))
+    return gaps
+
+
 if __name__ == "__main__":  # smallest check that fails if the two shapes get confused
     from zoneinfo import ZoneInfo
 

@@ -7,7 +7,14 @@ import json
 import pytest
 
 from Jarvis.storage import db
-from Jarvis.storage.models import find_message, record_llm_spend, record_message, spend_today
+from Jarvis.storage.models import (
+    brief_posted,
+    find_message,
+    record_brief,
+    record_llm_spend,
+    record_message,
+    spend_today,
+)
 
 
 def test_record_and_find():
@@ -74,3 +81,51 @@ def test_spend_survives_a_restart():
     record_llm_spend("2026-09-11", 10, 10, 0.30)
 
     assert spend_today("2026-09-11") == pytest.approx(0.90)
+
+
+# --- the brief claim: the one thing standing between a restart and two briefs ---
+
+
+DAY = "2026-09-11"
+
+
+def briefs_for(day: str) -> int:
+    return db.connect().execute("SELECT COUNT(*) FROM briefs WHERE day = ?", (day,)).fetchone()[0]
+
+
+def test_an_unclaimed_day_has_no_brief():
+    assert brief_posted(DAY) is False
+
+
+def test_the_first_claim_wins_and_the_second_loses():
+    assert record_brief(DAY) is True, "the first caller owns the day"
+    assert record_brief(DAY) is False, "the second must lose, not raise"
+    assert brief_posted(DAY) is True
+
+
+def test_a_lost_claim_writes_no_second_row():
+    """A claim that overwrote instead of conflicting would hand every caller the day."""
+    record_brief(DAY)
+    first = db.connect().execute("SELECT created_at FROM briefs WHERE day = ?", (DAY,)).fetchone()[0]
+
+    record_brief(DAY)
+
+    assert briefs_for(DAY) == 1
+    row = db.connect().execute("SELECT created_at FROM briefs WHERE day = ?", (DAY,)).fetchone()
+    assert row[0] == first, "the losing claim must not touch the winning row"
+
+
+def test_the_claim_survives_a_restart():
+    """The table, not the scheduler, is what stops a 07:01 restart posting a second brief."""
+    assert record_brief(DAY) is True
+
+    db.connect.cache_clear()  # a restart: same file, fresh connection
+
+    assert record_brief(DAY) is False, "a restarted process must not reclaim the day"
+    assert briefs_for(DAY) == 1
+
+
+def test_each_day_is_its_own_claim():
+    assert record_brief(DAY) is True
+    assert record_brief("2026-09-12") is True
+    assert briefs_for(DAY) == 1 and briefs_for("2026-09-12") == 1

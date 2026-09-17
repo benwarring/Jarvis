@@ -143,6 +143,18 @@ def calendar_create(title: str, when: str, duration: int | None = None) -> tuple
     return f"Booked: {event.title} - {_when(event.start)}.", event.id
 
 
+def brief_read(day: str | None = None) -> str:
+    # Imported inside the function, not at module scope: the planner is free to reuse
+    # the formatters above, and a top-level import here would close that circle.
+    from Jarvis.scheduler.planner import build_plan, render
+
+    when = parse_when(day) if day else None
+    if day and when is None:
+        return f"Couldn't read a day out of '{day}'."
+    # ONE builder for both doors: the 07:00 job runs this same tool through dispatch.
+    return render(build_plan(when.date() if when else None))
+
+
 # Page-creating tools return (message, external_id); the rest return a bare
 # message. `manager.dispatch` normalises both to a tuple for its callers.
 TOOLS: dict[str, Callable[..., str | tuple[str, str | None]]] = {
@@ -153,6 +165,8 @@ TOOLS: dict[str, Callable[..., str | tuple[str, str | None]]] = {
     "task.list": task_list,
     "task.complete": task_complete,
     "calendar.agenda": calendar_agenda,
+    # A read: it builds and renders, it writes nothing, so no confirmation.
+    "brief.read": brief_read,
     # Never dispatched by a slash command or the fast-path directly: a calendar
     # write only runs from the confirmation flow, after a human ✅.
     "calendar.create": calendar_create,
@@ -175,6 +189,7 @@ LLM_NAMES: dict[str, str] = {
     "list_tasks": "task.list",
     "complete_task": "task.complete",
     "list_calendar_events": "calendar.agenda",
+    "daily_brief": "brief.read",
     "create_calendar_event": "calendar.create",
 }
 
@@ -243,6 +258,12 @@ TOOL_SCHEMAS: list[dict] = [
     _fn(
         "list_calendar_events",
         "Read the calendar for one day.",
+        {"day": _STR | {"description": "Which day, in the user's own words. Omit for today."}},
+        [],
+    ),
+    _fn(
+        "daily_brief",
+        "Read the day's brief: what is on the calendar, what is due, and where the free time is.",
         {"day": _STR | {"description": "Which day, in the user's own words. Omit for today."}},
         [],
     ),

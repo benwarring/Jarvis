@@ -12,7 +12,9 @@ from datetime import date, datetime, timedelta, timezone
 import pytest
 
 from Jarvis.integrations import gcal
-from Jarvis.utils.dates import to_local
+from Jarvis.utils.dates import to_local, to_utc
+
+from tests.conftest import FAKE_ENV
 
 TIMED = {
     "id": "t1",
@@ -217,3 +219,102 @@ def test_a_failure_does_not_leak_the_key_file_path(google, fake_env):
     with pytest.raises(gcal.CalendarError) as exc:
         gcal.list_events(date(2026, 9, 7))
     assert fake_env["GOOGLE_SERVICE_ACCOUNT_FILE"] not in str(exc.value)
+
+
+# --- the gap arithmetic (plan.md section 8) ---------------------------------
+#
+# `free_slots` is pure — no network, no config, no clock — so every case below is an
+# Event built by hand. Each one is a real day that would otherwise post a silently
+# wrong schedule: a nested meeting inventing a gap, an all-day event ignored, a
+# 19-minute sliver offered as work time, a 06:00 event discarded instead of clipped.
+
+GAP_DAY = date(2026, 9, 7)  # a Monday in EDT, no DST transition to muddy the arithmetic
+
+# The shipped window, from the same values config will hand `free_slots` in production.
+WINDOW = {
+    "start_hour": int(FAKE_ENV["WAKING_HOURS_START"]),
+    "end_hour": int(FAKE_ENV["WAKING_HOURS_END"]),
+    "min_minutes": int(FAKE_ENV["MIN_SCHEDULABLE_GAP_MINUTES"]),
+}
+FLOOR = WINDOW["min_minutes"]
+OPEN = f"{WINDOW['start_hour']:02d}:00"
+CLOSE = f"{WINDOW['end_hour']:02d}:00"
+
+
+def at(hhmm: str) -> datetime:
+    """Local wall clock on GAP_DAY, as stored: UTC. "24:00" is the following midnight."""
+    hours, _, minutes = hhmm.partition(":")
+    return to_utc(datetime(2026, 9, 7) + timedelta(hours=int(hours), minutes=int(minutes)))
+
+
+def busy(start: str, end: str, all_day: bool = False) -> gcal.Event:
+    return gcal.Event("e", "busy", at(start), at(end), all_day, None)
+
+
+def slots(events: list[gcal.Event]) -> list[tuple[str, str]]:
+    """Free gaps back in local "HH:MM", so a failure reads as clock times."""
+    return [
+        (f"{to_local(lo):%H:%M}", f"{to_local(hi):%H:%M}")
+        for lo, hi in gcal.free_slots(events, GAP_DAY, **WINDOW)
+    ]
+
+
+@pytest.mark.parametrize(
+    "events, expected",
+    [
+        pytest.param([], [(OPEN, CLOSE)], id="an-empty-day-is-one-gap-the-whole-window"),
+        pytest.param([(OPEN, CLOSE)], [], id="a-fully-booked-day-has-no-gaps"),
+        pytest.param(
+            [("09:00", "11:00"), ("10:00", "12:00")],
+            [(OPEN, "09:00"), ("12:00", CLOSE)],
+            id="overlapping-events-merge-into-one-block",
+        ),
+        pytest.param(
+            [("09:00", "13:00"), ("10:00", "11:00")],
+            [(OPEN, "09:00"), ("13:00", CLOSE)],
+            id="an-event-nested-inside-another-invents-no-gap",
+        ),
+        pytest.param(
+            [("10:00", "11:00"), ("09:00", "13:00")],
+            [(OPEN, "09:00"), ("13:00", CLOSE)],
+            id="the-nested-case-again-with-the-feed-out-of-order",
+        ),
+        pytest.param([("08:00", "12:00"), ("12:00", CLOSE)], [], id="back-to-back-leaves-no-sliver"),
+        pytest.param([("00:00", "24:00", True)], [], id="an-all-day-event-covers-the-window"),
+        pytest.param(
+            [(OPEN, "10:00"), (f"10:{FLOOR:02d}", CLOSE)],
+            [("10:00", f"10:{FLOOR:02d}")],
+            id="a-gap-exactly-the-floor-is-kept",
+        ),
+        pytest.param(
+            [(OPEN, "10:00"), (f"10:{FLOOR - 1:02d}", CLOSE)],
+            [],
+            id="a-gap-one-minute-under-the-floor-is-dropped",
+        ),
+        pytest.param(
+            [("06:00", "09:00"), ("21:00", "23:30")],
+            [("09:00", "21:00")],
+            id="events-overhanging-either-edge-are-clipped-not-discarded",
+        ),
+        pytest.param([("05:00", "06:00")], [(OPEN, CLOSE)], id="an-event-wholly-before-the-window-drops"),
+        pytest.param([("07:00", OPEN)], [(OPEN, CLOSE)], id="an-event-ending-at-the-window-start-is-not-busy"),
+    ],
+)
+def test_the_gap_table(events, expected):
+    assert slots([busy(*e) for e in events]) == expected
+
+
+def test_the_gap_table_covers_the_window_config_actually_ships():
+    """If plan.md's defaults move, the table above is asserting on a window nobody runs."""
+    cfg = gcal.get_config()
+    assert (cfg.waking_hours_start, cfg.waking_hours_end, cfg.min_schedulable_gap_minutes) == (
+        WINDOW["start_hour"],
+        WINDOW["end_hour"],
+        WINDOW["min_minutes"],
+    )
+
+
+def test_gaps_come_back_as_tz_aware_utc():
+    """Stored UTC, rendered local — a naive datetime here would render as the wrong hour."""
+    for lo, hi in gcal.free_slots([busy("09:00", "11:00")], GAP_DAY, **WINDOW):
+        assert lo.tzinfo == timezone.utc and hi.tzinfo == timezone.utc

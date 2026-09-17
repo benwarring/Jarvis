@@ -54,6 +54,13 @@ FAKE_ENV = {
     "OPENAI_API_KEY": "not-a-real-key",
     "OPENAI_MODEL": "gpt-4.1-mini",
     "LLM_DAILY_SPEND_LIMIT_USD": "1.00",
+    # The daily brief's arithmetic. plan.md's defaults, so a test that asserts on the
+    # schedule is asserting on the shipped numbers.
+    "WAKING_HOURS_START": "8",
+    "WAKING_HOURS_END": "22",
+    "MIN_SCHEDULABLE_GAP_MINUTES": "20",
+    "DEFAULT_TASK_ESTIMATE_MINUTES": "30",
+    "DAILY_BRIEF_TIME": "07:00",
     "TIMEZONE": "America/New_York",
 }
 

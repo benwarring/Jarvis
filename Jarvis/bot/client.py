@@ -42,7 +42,7 @@ def build_bot() -> commands.Bot:
     # Imported here, not at module scope: handlers and the command groups import
     # is_owner / respond back out of this package.
     from Jarvis.bot import handlers
-    from Jarvis.bot.commands import agenda, event, grocery, todo
+    from Jarvis.bot.commands import agenda, brief, event, grocery, todo
 
     cfg = get_config()
     intents = discord.Intents.default()
@@ -70,6 +70,7 @@ def build_bot() -> commands.Bot:
     grocery.setup(bot)
     agenda.setup(bot)
     event.setup(bot)
+    brief.setup(bot)
     bot.event(handlers.on_message)
     bot.event(handlers.on_raw_reaction_add)
 

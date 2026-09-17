@@ -1257,3 +1257,310 @@ write/test separation being off this round did not produce a worse outcome
 than the normal process would have. Fix FW-M1's plan edit whenever `messages`
 is next touched — ideally before Phase 9 (undo) starts, since that phase is
 exactly where the gap stops being free.
+
+---
+
+# Phase 6 Review — daily brief
+
+Scope: the daily brief only — `scheduler/planner.py`, `scheduler/jobs.py`,
+`integrations/gcal.py`, `storage/models.py`, `storage/db.py`, `agent/tools.py`,
+`bot/commands/brief.py`, `config.py`, `main.py`, `router/intents.py`, plus
+`plan/plan.md` §5a, §3, §6, §12, and the new §15. Security has already
+reviewed this phase and found nothing at MEDIUM+; not re-audited here. Ran
+`python -m pytest tests/ -q`: **556 passed**, 0 failed. Made no OpenAI call.
+Nothing under `Jarvis/` or `tests/` was edited — the only write is this entry.
+
+## Findings
+
+### MEDIUM
+
+**P6-M1 — The "importing MAX_LEN back would be a cycle" claim is false, and
+disproved by running it.** Files: `Jarvis/scheduler/planner.py:27-30`,
+`Jarvis/agent/tools.py:27`. `agent/tools.py`'s only reference to
+`scheduler.planner` is `from Jarvis.scheduler.planner import build_plan,
+render` **inside** `brief_read()` (`agent/tools.py:149`), a function-scoped
+import specifically deferred so `tools.py` never needs `planner` at module
+load. That means `planner.py` importing `MAX_LEN` from `agent.tools` at
+module scope cannot cycle: loading `planner` would trigger loading `tools`,
+and `tools` completes without needing `planner` back. I built a scratch
+module (not `Jarvis/scheduler/planner.py` itself) with planner's real import
+list plus `from Jarvis.agent.tools import MAX_LEN` added, and ran it against
+the live tree:
+```
+no cycle: planner-shaped module imported agent.tools.MAX_LEN = 1900
+```
+and separately confirmed `'Jarvis.scheduler.planner' not in sys.modules`
+after importing `Jarvis.agent.tools` alone. So today, right now, there is no
+cycle to avoid — the comment at both sites is describing a cycle that would
+only exist if `tools.py`'s deferred import were hoisted to module scope,
+which it deliberately is not.
+**Fix:** delete `planner.py:27-30`'s `MAX_LEN = 1900` and its comment; add
+`from Jarvis.agent.tools import MAX_LEN` to planner's imports. One constant,
+one home, reusing what's already in the tree (rung 2) rather than
+maintaining two copies with a false justification.
+
+### LOW
+
+**P6-L1 — `HIGH = "High"` in `planner.py` duplicates a literal `notion.py`
+already owns.** `Jarvis/scheduler/planner.py:34` vs.
+`Jarvis/integrations/notion.py:23` (`_PRIORITY_RANK = {"High": 0, "Medium":
+1, "Low": 2}`). `notion.py` is the module plan.md §6 designates as the single
+place Notion property *values* are declared ("Property names are declared
+once as constants at the top of `integrations/notion.py`... rename a
+property in Notion and exactly one line changes"); the `"High"` string
+belongs there, not re-guessed in `planner.py`. `_PRIORITY_RANK` is
+underscore-private, so `planner.py` reaching into it would be worse than the
+status quo — the fix is to promote a public `HIGH = "High"` constant in
+`notion.py` (next to or replacing the raw literal inside
+`_PRIORITY_RANK`) and have `planner.py` do `from Jarvis.integrations.notion
+import HIGH`. `planner.py` already imports `notion` at module scope, so this
+is zero new coupling, just redirecting an existing one.
+
+**P6-L2 — The time-span format string is duplicated byte-for-byte.**
+`Jarvis/agent/tools.py:68` (`f"{to_local(e.start):%I:%M%p}-{to_local(e.end):%I:%M%p}"`,
+inline in `_format_events`) and `Jarvis/scheduler/planner.py:130-131`
+(`_span`, the identical expression, just named). CLAUDE.md's "store UTC,
+render local... timezone conversion happens in `utils/dates.py` at the
+edges, nowhere else" is written about conversion, but the same reasoning
+covers the one bit of *rendering* that both callers need character-for-
+character identical: a `%I:%M%p`-`%I:%M%p` span. Recommend a small
+`format_span(start, end) -> str` in `utils/dates.py`, imported by both. Not
+blocking — the two full line-builders (`_format_events`/`_event_line`,
+`_format_tasks`/`_task_line`) render for different audiences (numbered list
+vs. plain brief template) and shouldn't be forced into one function; only
+the span expression is genuinely identical and worth moving.
+
+## Ruling on item 1 — plan.md §5a's six steps
+
+Confirmed arithmetic-only, exactly one LLM call, called last, over an
+already-built structure:
+
+- **Steps 1/2/4/5 are pure arithmetic.** `build_plan` (`planner.py:77-114`)
+  calls `gcal.list_events` once, `gcal.free_slots` (pure interval
+  arithmetic — clip, merge, subtract, no network, no config; verified by its
+  own `__main__` self-check covering all six edge cases plan.md §8 names),
+  filters tasks with `_relevant` (a date comparison), and fits them with
+  `_fit` (a greedy first-fit loop). No LLM import, no LLM call, anywhere in
+  this function or anything it calls.
+- **Exactly one LLM call, and it happens last.** `render()`
+  (`planner.py:188-223`) is the only function in the reviewed files that
+  calls `complete()`, and it is called on the already-finished `Plan` /
+  `render_plain(plan)` string — never before `build_plan` runs.
+  `test_the_model_is_handed_the_finished_plan_not_a_request_to_compute_one`
+  asserts the user message handed to the model **equals**
+  `render_plain(plan)` verbatim, i.e. the model receives prose of a decision
+  already made, not raw data to decide from.
+- **The model cannot influence the schedule.** The call carries `tools=[]`
+  (`test_the_briefs_call_carries_no_tools`), so there is no mechanism for the
+  model to call back into `build_plan`, gcal, or Notion. When the stubbed
+  reply actively lies about the schedule
+  (`test_a_model_that_contradicts_the_arithmetic_does_not_change_the_plan`,
+  reply: "You are free all day. I moved the dentist to 5pm."), the test
+  asserts `plan.scheduled`/`plan.free_minutes`/`plan.unscheduled` are
+  byte-identical before and after the call, and that the returned text is
+  exactly the model's string — the plan object itself is never touched.
+  This is the one property that matters most for this finding, and it's
+  directly tested, not just plausible by inspection.
+
+**Clean.** No LLM in the gap-finding, one call, called last, no channel back
+into the schedule.
+
+## Ruling on item 2 — one implementation, two doors
+
+`jobs._post_brief` (`scheduler/jobs.py:78-80`) calls
+`dispatch(Intent(name="brief.read", args={}, source="schedule"))`, exactly
+the same `Intent` shape `bot/commands/brief.py:20` builds for `/brief`
+(`source="slash"` is the only difference, and `source` is never branched on
+inside `dispatch` or `brief_read`). Both paths land on
+`agent/tools.py:brief_read`, which does one thing:
+`render(build_plan(when.date() if when else None))`. Layer 2's `daily_brief`
+tool name maps to the same `"brief.read"` key in `LLM_NAMES`
+(`agent/tools.py:192`). Grepped the whole tree for `build_plan(` and
+`render(` outside `planner.py`/`agent/tools.py`: zero other call sites.
+**One builder, three doors, confirmed by reading the code, not just by the
+docstring's claim to that effect** (`agent/tools.py:154`: "ONE builder for
+both doors: the 07:00 job runs this same tool through dispatch" —
+accurate).
+
+## Ruling on item 3 — `find_free_slots` vs. `free_slots`
+
+**Delete `find_free_slots`.** It has exactly one caller anywhere in the tree
+— its own test (`tests/unit/test_gcal.py:326`) — and zero production
+callers; grepped every file for `find_free_slots` and the only hits are
+`gcal.py`'s own definition, that one test, and `plan.md`'s now-stale module
+map line (see Plan honesty below). The reasoning that produced `free_slots`
+was correct and should be finished, not left half-done: `build_plan` reads
+`gcal.list_events(day)` exactly once and hands the same `events` list to
+`free_slots` for both the agenda and the gaps, which is *why* the agenda and
+the free-time computation cannot disagree. `find_free_slots` is a
+convenience wrapper that re-reads the calendar itself
+(`gcal.py:200-207`: `list_events(day)` then `free_slots(...)`) — keeping it
+around is an attractive nuisance: the very next feature that wants "just the
+gaps" (a `/freetime` command, say) has an easy one-call function sitting
+right there that reintroduces the two-reads-can-disagree bug `build_plan`
+was written to avoid. There's no speculative caller named anywhere in
+plan.md to justify keeping it "for later" — per YAGNI, delete it and the one
+test that exercises it; if a future caller genuinely needs "today's gaps,
+one call, don't care about the event list," it's a two-line wrapper to write
+then, informed by whatever that caller actually needs.
+
+## Ruling on item 5 — `bot.run()` -> `asyncio.run` + `bot.start()`
+
+**Acceptable trade, not a regression.** Checked the installed discord.py
+source directly: `Client.run()` (`discord/client.py:853-938`) calls
+`utils.setup_logging(handler=..., formatter=..., level=..., root=root_logger)`
+at line 925, *then* wraps `self.start(...)` in `asyncio.run(runner())`.
+`Client.start()` alone never calls `setup_logging`. So the switch does drop
+discord.py's own handler setup, exactly as the brief states.
+But `Jarvis/utils/logging.py:22` already calls `logging.basicConfig(...)`
+the first time anything calls `get_logger()` — and `get_logger(__name__)`
+runs at **import** time in most of `Jarvis/`'s modules (`notion.py`,
+`gcal.py`, `manager.py`, `client.py`, `jobs.py`, `planner.py`, ...), all of
+which are imported by `main.py` well before `bot.start()` is ever reached.
+By the time the gateway does anything worth logging, the root logger is
+already configured with `Jarvis`'s own format and `LOG_LEVEL`. discord.py's
+internal loggers (`discord.gateway`, `discord.client`, etc.) propagate to
+the root logger by default with no handler of their own once `setup_logging`
+never runs, so they still print — through Jarvis's format string instead of
+discord.py's own colorized one. No log is lost; the only visible change is
+cosmetic formatting of discord.py's internal lines, which arguably serves
+CLAUDE.md's "structured logging" goal better than two divergent formats
+side by side would. `main.py:23-26`'s own comment states the real reason for
+the switch (APScheduler needs a running loop to bind to) and does not
+mention logging at all — the tradeoff is real but small, and correctly not
+the load-bearing reason for the change.
+
+## Ruling on the release-brief fix
+
+**Releasing on a failed send is the right fix; claim-after-send would be
+worse, not cleaner.** The whole reason `record_brief` is an atomic
+`INSERT ... ON CONFLICT DO NOTHING` (`storage/db.py:19-24`,
+`storage/models.py:66-79`) taken **before** the post
+(`scheduler/jobs.py:71-80`) is to close the only race that can double-post:
+two triggers (a coalesced misfire retry, two overlapping processes) racing
+to claim the same day. If the claim moved to *after* a successful
+`channel.send()` instead, the window between "check whether today is
+claimed" and "the network round-trip to Discord completes" would be wide
+open — two triggers could both observe "unclaimed," both build and send the
+brief, and only then race to claim, by which point both sends already
+landed. That is strictly worse than the accepted failure mode, not cleaner;
+"claim after send" sounds simpler but reopens exactly the bug the atomic
+claim exists to close. Claim-before-post with release-on-failure is the
+correct shape.
+
+The duplicate-brief edge case is disclosed honestly, not hidden: both
+`storage/models.py:82-91`'s `release_brief` docstring ("Releasing on a
+failed post trades a duplicate brief, in the narrow case where the send
+half-succeeded, against a missing one. A duplicate is an annoyance; a
+silent gap is the bug.") and `scheduler/jobs.py:83-86`'s inline comment on
+`_post_brief` name the exact scenario (Discord accepts the message but the
+HTTP response times out, `_post` sees an exception, releases, and a retry
+sends a second copy) and state plainly which failure it's trading against
+which. Nothing is swept under a comment claiming the fix is airtight. The
+mutation check claimed in the brief (breaking the release call, two named
+tests fail) matches what's here: `test_a_failed_post_hands_the_day_back` and
+`test_the_retry_after_a_failed_post_actually_posts` both directly exercise
+`_release`'s effect on `brief_posted()`, and both would fail if the release
+call were removed or no-opped.
+
+## Plan honesty (item 6)
+
+- **§15 (Phase 11 hub) does not overpromise.** Every bullet under "What
+  earns a place on it" points at data that already exists by Phase 6/9
+  (calendar+tasks+schedule structure, `messages`, `llm_spend`) rather than
+  inventing new capability, and "Constraints it inherits" repeats the
+  existing no-second-implementation/confirm-writes/allowlist rules verbatim
+  rather than relaxing them for the GUI. "The decision that shapes it" is
+  explicitly deferred to Phase 10, not resolved here — consistent with §14's
+  open-question framing. No claim in §15 requires new architecture Phases
+  1-6 don't already have a story for.
+- **§5a accurately describes the built code**, steps 1/2/4/5/6 match
+  `build_plan`/`_fit`/`render` exactly (see item 1 above). Step 3 ("Pull
+  today's weather (§5b) for the header line") is not implemented — there is
+  no weather field anywhere in `Plan` or `render_plain` — but that is
+  correctly scoped to Phase 7 in §12's table, so per this review's own
+  instructions it is not a Phase 6 finding; §5a's text still accurately
+  previews intended future behavior rather than falsely claiming it exists
+  today.
+- **§3's module map is now stale on the exact point item 3 asked me to
+  rule on.** `plan/plan.md:135-136`: `gcal.py list_events, create_event
+  (find_free_slots lands in Phase 6, when the daily brief is the first
+  thing to consume it)`. The function that actually landed and is consumed
+  is `free_slots(events, day, ...)`, not `find_free_slots` — the deviation
+  this review accepted in item 3. This line was not updated to reflect that
+  deviation, so a reader trusting §3 today would go looking for a function
+  that either doesn't do what they expect (a stale `find_free_slots` still
+  exists but is dead) or would be surprised `free_slots` isn't mentioned at
+  all. Fix: reword to name `free_slots(events, day, ...)` as the pure
+  function `build_plan` calls, and drop the `find_free_slots` mention
+  (which becomes moot anyway once P6-item-3's delete lands).
+
+## Test quality (item 7)
+
+Both named guarantees are asserted on calls/state, not return values:
+
+- **Always-posts** — `test_brief_job.py`'s `FakeChannel`/`FakeBot` record
+  what was actually sent (`bot.sent`, `bot.asked`, `bot.fetched`), not what
+  a function returned. `test_notion_being_down_still_posts_a_real_brief`,
+  `test_a_tool_that_blows_up_still_posts_something` (which also asserts the
+  leaked exception string `"hunter2"` does **not** appear in the sent text —
+  a real secret-leak guard, not a tautology), and
+  `test_discord_failing_does_not_take_the_job_down` all assert on
+  `bot.sent`/`bot.sent == []` directly.
+- **Double-post guard** — `test_a_second_trigger_on_the_same_day_posts_nothing`
+  calls `post(bot)` three times against the *same* `FakeBot` and asserts
+  `len(bot.sent) == 1`, which is exactly the shape that would fail if the
+  claim were checked-but-not-enforced. `test_a_day_already_claimed_is_not_posted_again_by_a_fresh_process`
+  and `test_a_day_nobody_claimed_still_posts` both drive the guard through
+  `record_brief` directly rather than through a second `post()` call,
+  isolating "is a stale claim from a *different* process respected" from
+  "does posting itself create the claim." `test_the_day_claimed_is_the_local_one_not_the_utc_one`
+  asserts on `brief_posted("2026-09-08")`/`brief_posted("2026-09-07")`
+  specifically, catching the UTC-date-line bug class rather than just
+  checking *a* day got claimed.
+- `planner.py`'s LLM-failure suite (`test_planner.py`) consistently asserts
+  `render(plan) == render_plain(plan)` — a real equality against the
+  deterministic fallback's actual output, not a truthiness check — across
+  four independently parametrized failure modes plus the spend-guard and
+  unreadable-counter cases, and `test_the_happy_path_returns_stripped_prose_and_bills_exactly_one_call`
+  asserts `len(calls) == 1` and the exact `(prompt_tokens,
+  completion_tokens)` billed, so a call fired twice or billed with the
+  wrong numbers would fail a named test, not just "look different."
+
+No return-value-only assertion found in either file for the properties this
+review was asked to check.
+
+## Verdict on the four review questions
+
+1. **Unnecessarily repeated blocks of code?** One real one worth a fix
+   (P6-M1, `MAX_LEN`, and it should be a straight import now that the cycle
+   claim is disproved), one small one worth a fix (P6-L1, `HIGH`), one
+   trivial one worth a fix (P6-L2, the span format string). None are urgent;
+   all three have a one-line fix already named above.
+2. **Helper functions for modularity?** Yes — `_fit`, `_relevant`,
+   `render`/`render_plain` cleanly separate arithmetic from prose from
+   fallback, and `jobs._claim`/`_release`/`_post` each do exactly one thing
+   with its own try/except, which is what makes the release fix easy to
+   verify in isolation.
+3. **Does the code do what it promises?** Yes, on every property checked:
+   arithmetic-only gap-finding, exactly one LLM call made last with no
+   schedule-mutation channel, one builder behind both doors, and the brief
+   provably still posts across every LLM/spend/Discord/sqlite failure mode
+   the test suite drives at it.
+4. **Does the project match the plan?** Yes apart from one stale line
+   (§3's `find_free_slots` module-map note, flagged above, mooted once that
+   function is deleted) and one correctly-out-of-scope gap (weather, §5a
+   step 3, properly deferred to Phase 7 per §12).
+
+## Phase-7 readiness
+
+**Clear to start.** No HIGH or blocking findings. The three items above
+(P6-M1, P6-L1, P6-L2) are optional cleanups with named one-line fixes, not
+defects — nothing about them touches behavior Phase 7 (weather) would build
+on. The one item that does bear on Phase 7 specifically is the `find_free_slots`
+ruling: deleting it now, before a weather-driven header line gives someone
+a reason to reach for "the free-slots function that also reads the
+calendar," removes the attractive nuisance while it's still free to remove.
+556/556 tests pass; the always-posts guarantee and the double-post guard are
+both genuinely load-bearing per the mutation check and the test-quality
+review above.

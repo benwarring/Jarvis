@@ -17,7 +17,7 @@ Companion diagram: [`jarvis-creation-flow.drawio`](jarvis-creation-flow.drawio).
 | Interface | Discord bot in a private guild | Channels give structure; a DM can't hold a `#daily-brief` |
 | Hosting | Dev laptop for now | Everything below is written so moving to a VPS is a config change |
 | Brain | Hybrid: deterministic fast-path, LLM fallback | Most daily traffic ("add milk") never touches the API |
-| Model | `gpt-4.1-mini-2025-04-14` via `OPENAI_MODEL` | Matches the configured `.env`. See §10 — the cost section and `requirements.txt` still assume Anthropic and need reconciling |
+| Model | `gpt-4.1-mini` via `OPENAI_MODEL` | §10 is resolved: `requirements.txt` pins `openai`, and §11 carries verified rates |
 | Calendar auth | Service account + shared calendar | Zero token-refresh maintenance. Tradeoff in §7 |
 | Notion | Two new databases, built from scratch | Schemas in §6 |
 | Timezone | `America/New_York` | Store UTC internally, render local at the edges |
@@ -132,16 +132,20 @@ Jarvis/
     fastpath.py        Layer 1 regex/keyword matching
     llm.py             Layer 2 LLM tool-use loop
   integrations/
-    gcal.py            list_events, create_event (find_free_slots lands in Phase 6,
-                       when the daily brief is the first thing to consume it)
+    gcal.py            list_events, create_event, free_slots. free_slots takes events
+                       rather than fetching them, so the brief reads the day once and
+                       the agenda and the gaps cannot disagree
     notion.py          add_task, add_grocery, query_open_tasks, complete_task
     weather.py         current conditions + daily forecast
     llm.py             LLM client wrapper + cost accounting. Tool *schemas* live in
                        agent/tools.py beside the implementations they describe, so
                        the two cannot drift apart
   scheduler/
-    jobs.py            registered cron jobs
-    planner.py         daily brief construction
+    jobs.py            APScheduler; the 07:00 brief, and the atomic day-claim that
+                       stops a restart posting a second one
+    planner.py         daily brief construction: build_plan and render_plain are
+                       deterministic, render adds the one LLM call and falls back to
+                       render_plain on any failure
     reminders.py       appointment + task nudges
   storage/
     db.py              SQLite connection, migrations
@@ -469,6 +473,7 @@ Each phase also ends with a §9 review pass.
 | **8** | Reminders | Appointment lead-time pings and task nudges, idempotent across restart |
 | **9** | Hardening | Retries with backoff, rate-limit handling, errors to `#logs`, undo via ❌ (needs the `messages` rework in §6 first — one row per write, not per Discord message), spend guard (already built in Phase 5) |
 | **10** | Portability | Dockerfile + documented VPS deploy, so the laptop stops being load-bearing |
+| **11** | Control hub (GUI) | A single screen for Jarvis: today's schedule, open tasks, the grocery list, recent activity, and what Layer 2 has cost this month. See §15 |
 
 Unit tests (§8) are written alongside each phase, not batched at the end. The
 functional suite lands with Phase 9.
@@ -510,3 +515,52 @@ zero API cost is already worth having on your phone.
 - Do groceries need a "shopping trip" concept, or is a flat checked/unchecked list enough?
 - Appointment reminder lead time — 30 minutes is a placeholder, and it probably
   wants to vary by whether travel is involved.
+- **Phase 11's hub: native desktop or local web app?** It interacts with Phase 10 —
+  a native app assumes Jarvis runs on the same machine, so moving to a VPS would then
+  need an API built for it. Decide once Phase 10 is real, not before. See §15.
+
+---
+
+## 15. Control hub (Phase 11)
+
+A GUI that acts as the central place to see and steer Jarvis, rather than a second
+way to type at it. Discord stays the conversational interface — this is the dashboard
+Discord is bad at: state at a glance instead of a scrollback.
+
+### What earns a place on it
+
+- **Today** — the calendar, open tasks, and the computed schedule side by side. The
+  same structure §5a's brief builds, shown rather than narrated.
+- **Lists** — tasks and groceries, editable. Checking something off here does exactly
+  what ✅-ing it in Discord does.
+- **Activity** — what Jarvis did and when, from the `messages` table. This is the
+  first thing that makes the local SQLite worth having beyond idempotency.
+- **Cost** — Layer 2 spend today and this month from `llm_spend`, against the
+  `LLM_DAILY_SPEND_LIMIT_USD` ceiling. A number that currently exists but is invisible.
+- **Health** — is the bot connected, did the 07:00 brief post, is each integration
+  reachable. Today the honest answer to "is it working" is "read the console".
+
+### Constraints it inherits
+
+- **No second implementation.** The hub calls the same `agent/tools.TOOLS` entries
+  through `agent/manager.dispatch`. The rule that has held for slash commands, the
+  fast-path and the LLM holds here — a hub that writes its own "create an event" is
+  the bug §4 keeps warning about.
+- **Writes still confirm.** Calendar writes and multi-item batches need the same
+  confirmation the ✅ flow gives them. A button press is a confirmation; a button that
+  silently books is not.
+- **The allowlist still applies.** Whatever the transport, the hub is a command path,
+  and every command path checks the caller. A local-only bind is not an access control.
+
+### The decision that shapes it
+
+**Native desktop or local web app**, and it interacts with Phase 10. A native app
+talks to a bot on *this* laptop fine, but the moment Jarvis moves to a VPS it needs an
+API to talk to — so choosing native quietly adds a server phase later. A local web app
+(FastAPI serving a small page, or the same served from the VPS behind auth) costs a
+little more now and nothing later.
+
+Deferred deliberately until Phase 10 is real, because where Jarvis runs decides what
+the hub can be. Flagged in §14.
+
+---

@@ -60,6 +60,45 @@ def spend_today(day: str) -> float:
     return float(row["usd"]) if row else 0.0
 
 
+# --- daily brief (plan.md section 5a) ---------------------------------------
+
+
+def record_brief(day: str) -> bool:
+    """Claim a local day (YYYY-MM-DD) for the brief. True if THIS call claimed it.
+
+    One statement, so there is no window between checking and writing: the second
+    caller conflicts on the PRIMARY KEY and gets rowcount 0. Gate the scheduled post
+    on the return value - brief_posted is for reporting, not for deciding.
+    """
+    conn = connect()
+    with conn:
+        cur = conn.execute(
+            "INSERT INTO briefs (day, created_at) VALUES (?, ?) ON CONFLICT(day) DO NOTHING",
+            (day, datetime.now(timezone.utc).isoformat()),
+        )
+    return cur.rowcount == 1
+
+
+def release_brief(day: str) -> None:
+    """Give a claimed day back, so the brief can be attempted again.
+
+    The claim is taken before the brief is posted, because that is the only ordering
+    that stops two triggers double-posting. The cost is that a post which then fails
+    would leave the day claimed and the brief lost for good — and CLAUDE.md says twice
+    that the brief must always post. Releasing on a failed post trades a duplicate
+    brief, in the narrow case where the send half-succeeded, against a missing one.
+    A duplicate is an annoyance; a silent gap is the bug.
+    """
+    conn = connect()
+    with conn:
+        conn.execute("DELETE FROM briefs WHERE day = ?", (day,))
+
+
+def brief_posted(day: str) -> bool:
+    """Has a brief already been claimed for that local day?"""
+    return connect().execute("SELECT 1 FROM briefs WHERE day = ?", (day,)).fetchone() is not None
+
+
 if __name__ == "__main__":  # smallest check that fails if spend REPLACES instead of ACCUMULATES
     import sqlite3 as _sqlite3
 
@@ -78,4 +117,12 @@ if __name__ == "__main__":  # smallest check that fails if spend REPLACES instea
     assert spend_today("2026-09-12") == 1.00
     row = _mem.execute("SELECT * FROM llm_spend WHERE day = '2026-09-11'").fetchone()
     assert (row["prompt_tokens"], row["completion_tokens"]) == (300, 75)
+
+    # The brief claim: exactly one caller wins the day, and the loser is not an error.
+    assert brief_posted("2026-09-11") is False
+    assert record_brief("2026-09-11") is True, "first claim must win"
+    assert record_brief("2026-09-11") is False, "second claim must lose, not raise"
+    assert brief_posted("2026-09-11") is True
+    assert record_brief("2026-09-12") is True, "a different day is a different claim"
+    assert _mem.execute("SELECT COUNT(*) c FROM briefs").fetchone()["c"] == 2
     print("spend accounting ok")

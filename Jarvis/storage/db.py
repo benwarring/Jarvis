@@ -1,4 +1,4 @@
-"""SQLite connection and schema. Tables: messages (idempotency/undo) and llm_spend."""
+"""SQLite connection and schema. Tables: messages (idempotency/undo), llm_spend, briefs."""
 
 from __future__ import annotations
 
@@ -14,6 +14,13 @@ CREATE TABLE IF NOT EXISTS messages (
     args_json          TEXT NOT NULL,
     external_id        TEXT,
     created_at         TEXT NOT NULL
+);
+
+-- One row per local day. The PRIMARY KEY is the lock: claiming a day is an INSERT
+-- that either wins or conflicts, so a restart cannot post the brief twice.
+CREATE TABLE IF NOT EXISTS briefs (
+    day        TEXT PRIMARY KEY,
+    created_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS llm_spend (

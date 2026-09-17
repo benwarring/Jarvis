@@ -1133,3 +1133,309 @@ write-side fail-open is fixed by this wave; the check-then-record TOCTOU race
 under concurrent messages was out of this wave's scope and was not
 re-examined here — it remains open, bounded, and previously assessed as not
 blocking.
+
+---
+
+## Phase 6 Review — daily brief
+
+**Date:** 2026-09-16
+**Scope:** the scheduled job and everything new it touches — `Jarvis/scheduler/jobs.py`
+(new), `Jarvis/scheduler/planner.py` (new), `Jarvis/integrations/gcal.py`
+(`free_slots`/`find_free_slots`), `Jarvis/storage/models.py`
+(`record_brief`/`release_brief`/`brief_posted`), `Jarvis/storage/db.py` (the `briefs`
+table), `Jarvis/agent/tools.py` (`brief_read`, `TOOLS`, `LLM_NAMES`, `PROPOSAL_ONLY`),
+`Jarvis/bot/commands/brief.py`, `Jarvis/config.py` (the six new scheduler keys),
+`Jarvis/main.py` (`bot.run()` → `bot.start()` under `asyncio.run`), re-read
+`Jarvis/agent/manager.py`, `Jarvis/bot/client.py` and `Jarvis/integrations/llm.py` to
+check this phase against the allowlist/no-tools/credential contracts those files
+already established. `plan/plan.md` §5a and `.claude/personas/security-reviewer.md`
+read as the spec/brief this phase is audited against. **Method:** full read of every
+listed file, hand-traced `_post_brief`'s claim → dispatch → post → release sequence
+statement by statement against the double-post and repost-loop questions in the brief,
+hand-traced `render()`'s spend-guard-then-call ordering and confirmed the `tools=[]`
+call shape against `integrations/llm.py`'s request builder, grepped the tree for
+`find_free_slots`, `.run(`, `list_open_tasks`, and every `intent.source`/`PROPOSAL_ONLY`
+reference to confirm no per-source or per-caller authorization branch was hiding
+anywhere, and ran `python -m pytest tests/ -q` (556 passed, matches the brief). Did not
+open `.env` or `secrets/`, made no OpenAI call, did not start the bot. Report only — no
+file under `Jarvis/` or `tests/` was edited.
+
+### Findings
+
+No MEDIUM or HIGH findings. Two informational notes, neither a defect:
+
+**INFO — `jobs.py`'s `_claim`/`_release`/`_post` log with `log.exception`, not the
+type-name-only convention `notion.py`/`gcal.py`/`integrations/llm.py` use for
+provider calls.** `Jarvis/scheduler/jobs.py:100,110,124`. Traced rather than assumed:
+all three wrap calls that are either local SQLite (`record_brief`/`release_brief`,
+`storage/models.py`) or discord.py (`get_channel`/`fetch_channel`/`channel.send`) — never
+a Notion/Google/OpenAI call, so the "the error body echoes a signed request" reason
+`_call()`/`complete()` restrict themselves to the exception type name does not apply
+here. `log.exception` on a Discord failure already matches the codebase's own existing
+precedent (`bot/client.py:27,33` do the same for `discord.DiscordException`), and
+`log.exception` on a storage failure already matches `router/llm.py`'s `_record`
+(Phase 5, reviewed and accepted). Confirmed no credential or brief content is
+interpolated into any of these three log lines — only `day` (a date string) and
+`channel_id` (a non-secret config value) are ever passed as `%s` arguments; the
+brief `text` itself is never logged anywhere in `jobs.py`. Not a new pattern, not a
+leak — recorded so it isn't mistaken for a deviation on a future pass.
+
+**INFO — releasing the claim is a real fix for the stated bug, but its retry path is
+narrower than "release" might suggest.** `Jarvis/scheduler/jobs.py:81-86,104-110`.
+Traced what can actually consume a released claim: `record_brief`'s next caller must be
+another invocation of `_post_brief`, and in production the only thing that invokes it is
+APScheduler's cron trigger — once per calendar day, plus (via `misfire_grace_time`) at
+most one late catch-up run if the *same still-running* process's loop was delayed past
+07:00. `/brief` never claims or releases (confirmed by
+`test_brief_does_not_claim_the_day_out_from_under_the_job`), so it cannot consume a
+release either. A fresh process restart does not replay today's slot — `main.py:24-25`'s
+own comment states the trigger computes its next fire time from "now," and there is no
+startup catch-up check against `brief_posted()` anywhere in `jobs.start()`. Net effect:
+if the one daily post attempt fails and releases, nothing in the current code
+automatically retries later that same day — the practical benefit of releasing (over
+the prior behavior of keeping the claim) is that the day *can* be retried by a human or
+a future mechanism, not that it *will* be, same-day. This is a completeness/reliability
+nuance, not a security gap: it cannot loop (each `_post_brief` call claims-or-returns
+exactly once, and there is no code path that re-invokes it), and it cannot be triggered
+or influenced by anyone outside the process. The one way it can produce a visible
+duplicate — Discord accepting a message server-side while the client-side `send()` call
+still raises, so a later legitimate retry posts a second copy — is the exact tradeoff
+`release_brief`'s own docstring (`storage/models.py:82-90`) discloses and accepts
+("a duplicate is an annoyance; a silent gap is the bug"). Traced, not a finding.
+
+### Audit checklist — verified, not assumed
+
+**1. A scheduled job with no human at the other end — can it be triggered by anyone,
+and does it respect the allowlist?** No Discord-facing path reaches `_post_brief` at
+all: grepped every call site of `jobs._post_brief` and `jobs.start` — the only caller
+of `_post_brief` is APScheduler's own `CronTrigger` via `scheduler.add_job` (`jobs.py:46`),
+and the only caller of `jobs.start` is `main.py:29`. `/brief` (`bot/commands/brief.py`)
+calls `dispatch()` directly through `respond()`, never through `_post_brief`, and its own
+comment (`brief.py:17-19`) explains why it deliberately does not touch the `briefs`
+claim. `dispatch()` itself has never been an authorization boundary in this codebase —
+the allowlist is enforced at the three Discord entry points (`bot/client.py:62`'s
+`interaction_check`, `bot/handlers.py`'s `on_message`/`on_raw_reaction_add` guards) —
+and the scheduled job is a fourth caller of `dispatch()` that never touches Discord's
+identity model at all. That is the right design, not a gap: the allowlist question is
+"does the caller's claimed identity match the owner," and a cron firing on the
+process's own clock, with a hardcoded `Intent(name="brief.read", args={}, source=
+"schedule")` (`jobs.py:79`), has no caller identity to spoof and no attacker-controlled
+argument for one to inject — `args={}` is a literal, not built from any external input.
+Grepped every reference to `intent.source` (`agent/manager.py`'s two log lines only) —
+it is read for logging, never branched on for a permission decision, so `source=
+"schedule"` unlocks nothing a Discord-sourced intent couldn't already reach for the one
+tool it calls (`brief.read`, a read with no `PROPOSAL_ONLY`/`WRITE_NAMES` membership —
+confirmed at `tools.py:169,198` and asserted by `test_the_brief_is_a_read_not_a_write`).
+**Can the posted content be influenced by an outsider?** Yes, by design, and traced:
+`build_plan()` (`planner.py:88-105`) pulls `gcal.list_events()` and
+`notion.list_open_tasks()` verbatim, so an event title from an accepted invite or a
+task title from anyone with Notion database access reaches `render_plain()`
+(`_event_line`/`_task_line`, `planner.py:134-145`, interpolate `.title`/`.name`
+unescaped) and, when the LLM call succeeds, `render()`'s prompt (`planner.py:211-213`
+hands the whole rendered template to the model as the `user` message). This is not new
+exposure, though: the same titles already reach Discord verbatim today through
+`/agenda` and `render_plain` with no LLM in the loop at all (reviewed and accepted in
+Cycle 2/Phase 3-4) — Phase 6 adds a rewrite step, not a new disclosure. What Phase 6 is
+required to bound is whether that content can cause an *action*; see item 2.
+
+**2. Prompt injection via calendar/task content — no tools, and nothing downstream
+trusts the model's output as more than text.** Confirmed structurally, not from the
+comment: `planner.py:211-213` calls `complete([...], [])` — a literal empty list, not a
+variable that could be non-empty under some condition. `integrations/llm.py:76`:
+`**({"tools": tools, "tool_choice": "auto"} if tools else {})` — an empty list is
+falsy, so the request sent to OpenAI omits the `tools`/`tool_choice` keys entirely; this
+is the exact mechanism the Phase 5 fix wave verified closes round-2 injection in
+`router/llm.py`, reused here unchanged. OpenAI's function-calling contract cannot return
+a `tool_call` for a request that declared no callable functions, so a crafted title
+cannot make this call produce anything but a `choice.content` string. Traced every
+consumer of `render()`'s return value: `agent/tools.py:155` returns it as `brief_read`'s
+bare string result, `manager.dispatch` (`manager.py:36`) wraps it as `(message, None)`,
+and the only two callers of that (`jobs.py:78-80` and `/brief` via `respond()`) each
+send it straight to Discord as message text — `channel.send(text)`
+(`jobs.py:119`)/the interaction reply — with no parsing back into an `Intent`, a tool
+name, or any other structured form anywhere in the tree (grepped). The global
+`allowed_mentions=discord.AllowedMentions.none()` set once on the `commands.Bot`
+constructor (`bot/client.py:54-59`, established Pass 1/2) covers `jobs.py:119`'s
+`channel.send` too — it takes no competing `allowed_mentions` kwarg — so a title crafted
+as `@everyone ...` cannot ping anyone even after round-tripping through the model's
+prose. `MAX_LEN = 1900` truncation (`planner.py:171,216`) is applied to both
+`render_plain` and `render`'s return before anything is sent, so Discord's 2000-char cap
+can't be blown by a long injected title either (`test_the_model_cannot_blow_discords_
+message_cap`, `test_a_heavy_day_is_still_inside_discords_cap`). One soft residual worth
+naming and not overstating: the system prompt (`planner.py:179-185`) asks the model to
+rewrite the plan as prose, and a title engineered as a social-engineering line (e.g.
+plausible-looking "contact IT" instructions) could be smoothed into fluent prose that
+reads a little more authoritative than the same string sitting verbatim in a bracketed
+list — but the raw text was already reaching the owner's Discord verbatim via
+`render_plain`/`/agenda` before this phase, the model has no channel back into an
+action (the hard mitigation this item asks for), and the threat model is unchanged: an
+attacker still needs pre-existing calendar-invite or Notion-database access, the same
+prerequisite every prior pass accepted for the plain-text version of this exposure.
+
+**3. Runaway cost.** `render()` (`planner.py:188-223`) makes exactly one `complete()`
+call, guarded by `if spend_today(day) >= get_config().llm_daily_spend_limit_usd: ...
+return plain` (`planner.py:205-207`) checked *before* the call, matching
+`router/llm.py`'s established shape. No loop, no recursion, and no retry: every failure
+mode (`LLMError`, a bare `Exception` including an unreadable spend counter, an empty or
+whitespace-only reply) falls straight to `return plain` with nothing that calls
+`complete()` a second time — confirmed by reading the function's single `try` block and
+by `test_every_llm_failure_still_produces_the_brief`'s four parametrizations plus
+`test_the_happy_path_returns_stripped_prose_and_bills_exactly_one_call`'s
+`len(calls) == 1` assertion. `_post_brief` itself calls `dispatch()` — and therefore
+`render()` — exactly once per invocation, with no retry of the render step even when
+the *Discord post* afterward fails (`_release` only frees the day for a future trigger,
+it does not re-render or re-call the model). `misfire_grace_time=900`
+(`jobs.py:34,54`) plus `coalesce=True`/`max_instances=1` cannot produce a burst: a
+`CronTrigger` with one `hour:minute` has exactly one due time per calendar day, so grace
+and coalesce govern whether *that one* due firing is honored late or skipped — they
+have no mechanism to manufacture a second firing on the same day, and even if
+`max_instances` were misconfigured to allow overlap, `record_brief`'s atomic
+`INSERT ... ON CONFLICT DO NOTHING` (`storage/models.py:66-79`) means only the first of
+two concurrent calls would ever reach `dispatch()`/`render()` — the second loses the
+claim before either dispatch or the LLM call. Confirmed by
+`test_a_second_trigger_on_the_same_day_posts_nothing` and
+`test_a_loop_busy_at_0700_does_not_silently_drop_the_brief`. `/brief` adds no new risk:
+it is owner-gated at the tree level like every other slash command, and each invocation
+still passes through the same per-call spend guard — repeated `/brief` calls cost at
+most one call each until the daily limit trips, the same bargain Layer 2 already makes.
+
+**4. The double-post guard and release-on-failure.** Traced `_post_brief`
+(`jobs.py:67-86`) end to end: `_claim(day)` (a single atomic `INSERT ... ON CONFLICT DO
+NOTHING`, rowcount-checked) gates everything after it — a losing claim returns before
+`dispatch` is ever called, so a second concurrent or sequential trigger for an
+already-claimed day cannot post, full stop (`test_a_second_trigger_on_the_same_day_
+posts_nothing`, `test_a_day_already_claimed_is_not_posted_again_by_a_fresh_process`).
+`_release(day)` runs only in the branch where `_post()` returned `False`
+(`jobs.py:81-86`), and `_post()` returns `False` only when `channel.send`/
+`get_channel`/`fetch_channel` raised — meaning, in every test of the failure path,
+`bot.sent` is empty at the point of release (`test_a_failed_post_hands_the_day_back`).
+**Cannot loop:** nothing in `jobs.py` or elsewhere calls `_post_brief` again as a
+consequence of a release — the only thing that can consume a freed claim is a wholly
+separate future invocation (next day's cron, or, within the same day, only the
+misfire-grace catch-up of a *still-pending* due firing — never a second firing
+manufactured by the release itself). **Cannot double-post under a claim+release+retry
+sequence**, in the sense the brief asks: a retry after a release re-runs `_claim` (wins,
+since the row was deleted), re-runs `dispatch`/`render` (one more bounded LLM call, per
+item 3), and posts once — `test_the_retry_after_a_failed_post_actually_posts` asserts
+exactly one message lands on the retry. The only way to get two real Discord messages
+for one day is the at-least-once-delivery edge case already named in the informational
+note above (send succeeds server-side, raises client-side) — disclosed and accepted by
+the code's own docstring, not an unrecognized bug, and bounded to "one extra copy," never
+a growing burst. Also checked the interaction with `_claim`'s own fail-open branch
+(`jobs.py:96-101`, "posting it anyway" when `record_brief` itself raises): this trades
+the double-post guard for the also-explicit "the brief must always post" requirement
+when SQLite is broken, is reached at most once per `_post_brief` call same as the
+happy path, and requires the local `jarvis.db` file to already be unwritable/corrupt —
+not a state reachable from Discord. The spend guard is a separate, independently-checked
+mechanism inside `render()` and fails in the opposite direction (closed, not open) on its
+own read/write errors — the two guards were checked for interaction and do not
+undermine each other.
+
+**5. Credentials in the new surface.** Grepped `jobs.py` and `planner.py` for every
+`log.*` call and every f-string/`%s` argument: the values ever interpolated are `day`
+(a `YYYY-MM-DD` string), `channel_id` (a non-secret Discord snowflake from config), and
+`type(exc).__name__` (`planner.py:98,105`, matching the established gcal/notion
+convention exactly). Neither file imports or touches `notion_token`,
+`google_service_account_file`'s contents, or `openai_api_key` directly — all three stay
+behind `notion.list_open_tasks()`, `gcal.list_events()`/`gcal.free_slots()`, and
+`complete()`, each already using the `_call`-style wrapper that logs only the exception
+type and raises a hardcoded, credential-free message (re-verified unchanged in
+`integrations/llm.py:70-91`, `gcal.py:57-67`). `Config.__repr__`
+(`config.py:39-46`) still redacts exactly `{"discord_bot_token", "notion_token",
+"openai_api_key"}`; the six new scheduler fields (`waking_hours_start/end`,
+`min_schedulable_gap_minutes`, `default_task_estimate_minutes`, `daily_brief_time`,
+plus the existing `timezone`) are correctly left unredacted — none of them is a
+credential. The posted brief itself (`render_plain`/`render`'s output) is built purely
+from `Plan` — events, tasks, free-time arithmetic — and the LLM's prose reply; no
+credential is ever a field of `Plan`, a message in the `complete()` call, or reachable
+from anything `_post_brief` sends. `test_a_tool_that_blows_up_still_posts_something`
+directly exercises the "does an exception's text leak into the posted message" question
+(a `RuntimeError("token=hunter2")` raised from inside `TOOLS["brief.read"]`) and asserts
+`"hunter2" not in bot.sent[0]` — passes, because `manager.dispatch`'s bare `except
+Exception` (`manager.py:33-35`) replaces any tool exception with the fixed string
+`"Something went wrong on my end — that didn't go through."` before it ever reaches
+`_post_brief`. Clean.
+
+**6. `main.py`: `bot.run()` → `bot.start()` under `asyncio.run`.** Read end to end
+against the allowlist and cleanup contracts, not just the diff: `build_bot()`
+(`bot/client.py:41-88`) is unchanged — same intents, same `_owner_only` tree check, same
+handler registration — so the owner allowlist is untouched by this refactor regardless
+of how the client is driven. `async with bot:` (`main.py:28`) guarantees `bot.close()`
+runs on any exit, clean or not (discord.py's own `__aexit__`), and `jobs.start(bot)`
+(`main.py:29`) runs *before* `await bot.start(...)` so the cron job exists from the
+moment the gateway starts connecting — safe because `_post_brief` itself opens with
+`await bot.wait_until_ready()` (`jobs.py:71`), so a fire during connect blocks rather
+than posting into a half-open client (`test_the_job_waits_for_the_gateway_before_
+posting`). `finally: scheduler.shutdown(wait=False)` (`main.py:32-33`) runs whether
+`bot.start()` returns or raises, so a gateway failure cannot leave the scheduler's own
+thread/loop resources running past process exit — confirmed by
+`test_the_scheduler_comes_down_with_the_bot`, which raises from a fake `start()` and
+still asserts `shutdown_wait is False`. Grepped the whole tree for `.run(` — the only
+hits are `asyncio.run(_run(config))` (`main.py:42`) and a comment referencing the old
+`bot.run()`; no leftover `commands.Bot.run()` call anywhere that could open a second
+gateway connection. A failure out of `jobs.start()` (in practice, only a `TIMEZONE`
+that isn't a real IANA zone — `config.py` validates the format of the other five
+scheduler keys but not that `TIMEZONE` resolves) is not caught anywhere in `main()`
+except the outer `except KeyboardInterrupt`, so it crashes the process loudly at
+startup — stated as deliberate in the file's own docstring, and confirmed not a
+credential leak: a bad `TIMEZONE` raises `ZoneInfoNotFoundError` naming the zone string
+itself (a config value, not a secret). No regression to the allowlist, no orphaned
+scheduler, no second gateway, no credential exposed by the new startup failure mode.
+
+### Also checked while in these files
+
+- `gcal.free_slots`/`find_free_slots` (`gcal.py:142-207`) are pure interval arithmetic
+  with no network and no config reads inside `free_slots` itself — confirmed by
+  signature and by the module's own `__main__` self-check; `find_free_slots` is not
+  dead code, it's exercised by `tests/unit/test_gcal.py`. Neither is a new injection or
+  cost surface.
+- `notion.list_open_tasks` (`notion.py:179-186`), which `build_plan` calls, is a single
+  bounded `data_sources.query` with `page_size=limit` (default 25) and no pagination
+  loop — same shape already accepted for the other Notion read paths.
+- `brief.read` is correctly absent from both `PROPOSAL_ONLY` and (grepped)
+  `WRITE_NAMES` — it can never be held for confirmation and never needs to be, since it
+  writes nothing; `LLM_NAMES["daily_brief"] == "brief.read"` is the only way Layer 2 can
+  reach it, and reaching it buys a read, not a write.
+
+### Verdict
+
+**Can someone else access my personal information?** No. Every new call in this phase
+routes through the same credential-safe wrappers established in Phases 3-5
+(`gcal._call`, `notion._call`, `integrations/llm.complete`), none of which changed
+here, and grepping the two new files found no credential ever passed to a log call, an
+exception string, or a Discord send. The one new *content* exposure — calendar/task
+titles reaching an LLM prompt — is bounded to zero new *actions* (item 2) and is not a
+wider disclosure than the plain-text version of the same data Discord has shown since
+Phase 3/4.
+
+**Can anyone else make calls to Jarvis?** No new gap. The scheduled job adds a fourth
+caller of `dispatch()` that carries no Discord identity and needs none — it has a fixed
+intent name and empty args, it cannot be invoked from Discord by owner or non-owner
+alike, and `intent.source` is never branched on for permission. `/brief` is gated by
+the same tree-level `_owner_only` check as every other slash command, unchanged by this
+phase.
+
+**Is prompt injection via calendar/task content actually blocked, and does anything
+downstream trust the model's output?** Yes, blocked for the thing that matters: the
+brief's `complete()` call is made with a literal `[]` for tools, which OpenAI's API
+contract cannot answer with a tool call, so injected text can change only the wording of
+a message nobody but the owner reads — it cannot reach `dispatch()`, cannot become an
+`Intent`, and cannot trigger a write. Nothing downstream parses that prose as anything
+but a string handed to `channel.send`/an interaction reply; `AllowedMentions.none()` and
+the `MAX_LEN` truncation cover the two concrete abuses (pings, cap-busting) that plain
+text could otherwise carry. The one residual is soft (a title could read a little more
+convincing after the model smooths it into prose) and pre-exists this phase in kind, not
+in degree.
+
+**Is an unattended 07:00 job safe to leave running against live accounts?** Yes. It has
+exactly one bounded, guarded-before-the-call LLM invocation per real trigger; the
+double-post guard is atomic and was traced to be un-abusable into either a loop or a
+guaranteed double-post; the one duplicate-message edge case is a disclosed,
+non-repeating, non-costly tradeoff the code accepts on purpose; no credential reaches
+any output surface; and the job cannot be invoked, retimed, or fed attacker-controlled
+arguments by anyone over Discord, owner or otherwise. Recommend no fix before shipping
+Phase 6. The only forward-looking note: if a future phase ever adds a manual "retry
+today's brief" command, it should reuse `_claim`/`_release` rather than posting straight
+to the channel, so the guard traced here keeps covering it.
+
+---

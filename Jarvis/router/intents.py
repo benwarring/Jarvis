@@ -15,6 +15,7 @@ NAMES = frozenset(
         "task.complete",
         "calendar.agenda",
         "calendar.create",
+        "brief.read",
     }
 )
 
@@ -23,4 +24,4 @@ NAMES = frozenset(
 class Intent:
     name: str
     args: dict[str, Any]
-    source: str  # "slash" | "fastpath" | "llm"
+    source: str  # "slash" | "fastpath" | "llm" | "schedule"

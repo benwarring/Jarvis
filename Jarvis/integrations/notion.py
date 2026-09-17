@@ -20,7 +20,8 @@ from Jarvis.utils.logging import get_logger
 
 log = get_logger(__name__)
 
-_PRIORITY_RANK = {"High": 0, "Medium": 1, "Low": 2}
+HIGH = "High"  # plan.md section 6: a value of the Notion Priority select
+_PRIORITY_RANK = {HIGH: 0, "Medium": 1, "Low": 2}
 
 # plan.md section 6 categories. Longest matching keyword wins, so "ice cream" beats
 # "cream" and "toilet paper" beats the "oil" hiding inside "toilet".

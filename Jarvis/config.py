@@ -5,6 +5,7 @@ from __future__ import annotations
 import dataclasses
 import os
 from dataclasses import dataclass
+from datetime import datetime
 from functools import lru_cache
 
 from dotenv import load_dotenv
@@ -27,6 +28,11 @@ class Config:
     openai_api_key: str
     openai_model: str
     llm_daily_spend_limit_usd: float
+    waking_hours_start: int
+    waking_hours_end: int
+    min_schedulable_gap_minutes: int
+    default_task_estimate_minutes: int
+    daily_brief_time: str  # "HH:MM" local
     timezone: str
     db_path: str
 
@@ -56,9 +62,26 @@ _REQUIRED = (
     "OPENAI_API_KEY",
     "OPENAI_MODEL",
     "LLM_DAILY_SPEND_LIMIT_USD",
+    "WAKING_HOURS_START",
+    "WAKING_HOURS_END",
+    "MIN_SCHEDULABLE_GAP_MINUTES",
+    "DEFAULT_TASK_ESTIMATE_MINUTES",
+    "DAILY_BRIEF_TIME",
 )
 
-_INT_KEYS = tuple(k for k in _REQUIRED if k.startswith("DISCORD_") and k != "DISCORD_BOT_TOKEN")
+# The daily brief's arithmetic (plan.md section 5a). Every one of these is a number the
+# scheduler would otherwise hard-code, which is why none of them has a default here.
+_SCHEDULER_INT_KEYS = (
+    "WAKING_HOURS_START",
+    "WAKING_HOURS_END",
+    "MIN_SCHEDULABLE_GAP_MINUTES",
+    "DEFAULT_TASK_ESTIMATE_MINUTES",
+)
+
+_INT_KEYS = (
+    tuple(k for k in _REQUIRED if k.startswith("DISCORD_") and k != "DISCORD_BOT_TOKEN")
+    + _SCHEDULER_INT_KEYS
+)
 _FLOAT_KEYS = ("LLM_DAILY_SPEND_LIMIT_USD",)
 
 # One human, two Discord accounts. ID1 is required; further accounts are optional, so a
@@ -94,6 +117,20 @@ def get_config() -> Config:
             floats[key] = float(raw[key])
         except ValueError:
             problems.append(f"{key} (not a number)")
+    # A window that is backwards, or a brief time that is not a clock time, produces a
+    # silently wrong schedule every morning rather than a loud failure once. Caught here.
+    if "WAKING_HOURS_START" in ints and "WAKING_HOURS_END" in ints:
+        if not 0 <= ints["WAKING_HOURS_START"] < ints["WAKING_HOURS_END"] <= 24:
+            problems.append("WAKING_HOURS_START/WAKING_HOURS_END (need 0 <= start < end <= 24)")
+    for key in ("MIN_SCHEDULABLE_GAP_MINUTES", "DEFAULT_TASK_ESTIMATE_MINUTES"):
+        if ints.get(key, 1) < 1:
+            problems.append(f"{key} (must be a positive number of minutes)")
+    if raw["DAILY_BRIEF_TIME"]:
+        try:
+            datetime.strptime(raw["DAILY_BRIEF_TIME"], "%H:%M")
+        except ValueError:
+            problems.append("DAILY_BRIEF_TIME (not HH:MM)")
+
     for key, value in optional.items():
         if not value:
             continue
@@ -123,6 +160,11 @@ def get_config() -> Config:
         openai_api_key=raw["OPENAI_API_KEY"],
         openai_model=raw["OPENAI_MODEL"],
         llm_daily_spend_limit_usd=floats["LLM_DAILY_SPEND_LIMIT_USD"],
+        waking_hours_start=ints["WAKING_HOURS_START"],
+        waking_hours_end=ints["WAKING_HOURS_END"],
+        min_schedulable_gap_minutes=ints["MIN_SCHEDULABLE_GAP_MINUTES"],
+        default_task_estimate_minutes=ints["DEFAULT_TASK_ESTIMATE_MINUTES"],
+        daily_brief_time=raw["DAILY_BRIEF_TIME"],
         timezone=os.getenv("TIMEZONE", "").strip() or "America/New_York",
         db_path=os.getenv("DB_PATH", "").strip() or "jarvis.db",
     )

@@ -53,6 +53,11 @@ def to_local(dt: datetime) -> datetime:
     return dt.astimezone(_tz())
 
 
+def format_span(start: datetime, end: datetime) -> str:
+    """A start-to-end time span, rendered local. Stored UTC, shown in the user's zone."""
+    return f"{to_local(start):%I:%M%p}-{to_local(end):%I:%M%p}"
+
+
 def day_bounds(day: date) -> tuple[datetime, datetime]:
     """UTC half-open [start, end) covering one LOCAL calendar day.
 
