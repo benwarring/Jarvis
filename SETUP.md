@@ -26,7 +26,14 @@ the `.env` keys it produces.
 6. **Get the IDs** — enable *Settings -> Advanced -> Developer Mode*, then right-click
    each to *Copy ID*: the server, each channel, and **your own user account**.
 
-Produces: `DISCORD_BOT_TOKEN`, `DISCORD_GUILD_ID`, `DISCORD_OWNER_USER_ID`,
+   If you use Discord from more than one account, copy the ID of each. The first
+   goes in `DISCORD_OWNER_USER_ID1`, the second in `DISCORD_OWNER_USER_ID2`. Only
+   the first is required — a single-account setup needs no placeholder for the
+   second, and a typo in it fails at startup rather than silently locking that
+   account out.
+
+Produces: `DISCORD_BOT_TOKEN`, `DISCORD_GUILD_ID`, `DISCORD_OWNER_USER_ID1`,
+`DISCORD_OWNER_USER_ID2` (optional),
 `DISCORD_INBOX_CHANNEL_ID`, `DISCORD_BRIEF_CHANNEL_ID`,
 `DISCORD_GROCERY_CHANNEL_ID`, `DISCORD_LOG_CHANNEL_ID`
 
@@ -80,7 +87,7 @@ New page -> `/database - full page` -> name it **Tasks**. Add these properties
 | `Status` | Status | `Not started`, `In progress`, `Done` |
 | `Due` | Date | |
 | `Priority` | Select | `High`, `Medium`, `Low` |
-| `Estimate` | Number | Minutes |
+| `Estimate` | Number | Leave the format as plain *Number* — the value is a count of minutes, and Notion has no minutes format |
 | `Project` | Select | (add as you go) |
 | `Notes` | Text | |
 | `Source` | Select | `discord`, `manual` |
@@ -105,16 +112,33 @@ On **each** database page: `•••` (top right) -> *Connections* -> *Connect 
 cascade. A database the integration isn't connected to returns 404, not 403 —
 which reads like a wrong ID and sends you debugging the wrong thing.
 
-### 3e. Get the database IDs
+### 3e. Get the data source IDs — not the IDs in the URL
 
-Open each database as a full page and read the URL:
+**The ID in a Notion URL is the wrong one.** Notion's current API splits a database
+into the database itself and one or more *data sources* underneath it, and every read
+and write here addresses the data source. Pasting the URL's ID gets you
+`Provided database_id ... is a page, not a database` or a 404, neither of which says
+"you used the wrong kind of ID".
 
+The data source ID is not shown anywhere in the Notion UI, so ask the API for it —
+after step 3d, with `NOTION_TOKEN` already in `.env`:
+
+```bash
+python -c "
+from Jarvis.config import get_config
+from notion_client import Client
+for d in Client(auth=get_config().notion_token).search(
+        filter={'property':'object','value':'data_source'}, page_size=50)['results']:
+    title = ''.join(t['plain_text'] for t in d['title'])
+    print(repr(title), d['id'].replace('-',''))
+"
 ```
-https://www.notion.so/<workspace>/<32-char-database-id>?v=<view-id>
-                                  ^^^^^^^^^^^^^^^^^^^^ this part
-```
 
-Produces: `NOTION_TOKEN`, `NOTION_TASKS_DB_ID`, `NOTION_GROCERIES_DB_ID`
+Each line is a database the integration can actually reach, with the ID to paste. A
+database missing from that list has not been connected — go back to 3d.
+
+Produces: `NOTION_TOKEN`, `NOTION_TASKS_DB_ID`, `NOTION_GROCERIES_DB_ID` (both holding
+**data source** IDs)
 
 ---
 
@@ -124,22 +148,15 @@ Produces: `NOTION_TOKEN`, `NOTION_TASKS_DB_ID`, `NOTION_GROCERIES_DB_ID`
 2. Set a monthly spend limit in *Billing -> Limits* while you're there. Belt and
    braces with the in-app spend guard.
 
-Produces: `OPENAI_API_KEY`, `OPENAI_MODEL`
+Produces: `OPENAI_API_KEY`, `OPENAI_MODEL`, `LLM_DAILY_SPEND_LIMIT_USD`
 
-> `requirements.txt` still pins the `anthropic` client and no OpenAI client. See
-> `plan/plan.md` §10 — that has to be reconciled before Phase 5.
-
----
-
-## 5. Weather — deferred to Phase 7
-
-No provider chosen yet, so there is nothing to set up here. Whoever picks one
-(`plan/plan.md` §14) should add the section: signup, the key name, and whether the
-free tier covers one forecast fetch per day.
+> `OPENAI_MODEL` is read from `.env` and never hard-coded, so changing model or
+> provider is a config change. `LLM_DAILY_SPEND_LIMIT_USD` is the in-app ceiling —
+> Layer 2 refuses to call out once the day's spend reaches it.
 
 ---
 
-## 6. Local environment
+## 5. Local environment
 
 ```bash
 python -m venv .venv

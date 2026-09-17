@@ -7,7 +7,6 @@ secrets/
 token.json
 credentials.json
 gcal-service-account.json
-plan/
 
 # Local state
 jarvis.db
@@ -28,7 +27,7 @@ htmlcov/
 
 # Logs
 *.log
-logs/
+/logs/
 
 # Editors / OS
 .vscode/
