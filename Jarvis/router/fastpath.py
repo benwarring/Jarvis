@@ -1,7 +1,7 @@
 """Layer 1: deterministic regex matching. Free, and it should catch most daily traffic.
 
 Patterns come from plan.md section 4, limited to the intents that exist so far
-(weather.read is a later phase).
+(weather phrasings are deliberate near-misses: there is no weather capability).
 
 READ-ONLY. This layer may never emit calendar.create - a regex is not allowed to book
 time on a real calendar. Event creation is slash-command only, and then behind a check.

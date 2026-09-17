@@ -156,15 +156,7 @@ Produces: `OPENAI_API_KEY`, `OPENAI_MODEL`, `LLM_DAILY_SPEND_LIMIT_USD`
 
 ---
 
-## 5. Weather — deferred to Phase 7
-
-No provider chosen yet, so there is nothing to set up here. Whoever picks one
-(`plan/plan.md` §14) should add the section: signup, the key name, and whether the
-free tier covers one forecast fetch per day.
-
----
-
-## 6. Local environment
+## 5. Local environment
 
 ```bash
 python -m venv .venv

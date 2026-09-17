@@ -71,7 +71,7 @@ MISSES = [
     "remind me to",
     "add milk to the list",          # no "grocery"/"todo" -- ambiguous, leave it to Layer 2
     "what do i have for lunch",      # "lunch" is not a day word, so it is not an agenda
-    "is it going to rain?",          # weather.read is a later phase
+    "is it going to rain?",          # no weather capability; must stay a miss
     "weather",
     "/todo add milk",                # slash commands are Layer 0
     "!ping",

@@ -33,7 +33,6 @@ structural view — §3 is the runtime view of how a single request moves.
 Agent Manager
 ├── Tools
 │   ├── Daily Jobs
-│   │   ├── Weather update
 │   │   └── Reminders
 │   │       ├── Appointments
 │   │       └── Tasks
@@ -67,10 +66,9 @@ since its sibling is `Grocery List` and those are the two databases in §6.
 | From the diagram | Status before |
 |---|---|
 | **Agent Manager** as an explicit layer | Implicit — the router did dispatch with no named owner |
-| **Weather update** | Entirely new. Needs a provider and a credential — see §14 |
 | **Reminders** (appointments + tasks) | New. Distinct from the daily brief: nudges through the day, not one 07:00 post |
 | **Task Scheduler** as a peer integration | Was buried as "APScheduler inside `scheduler/`" |
-| **Testing** as a first-class branch | Was one line in Phase 7 |
+| **Testing** as a first-class branch | Was one line in the build phases |
 | **Reviewers** (Security + Standards) | Existed as persona files, absent from the plan |
 
 ---
@@ -136,7 +134,6 @@ Jarvis/
                        rather than fetching them, so the brief reads the day once and
                        the agenda and the gaps cannot disagree
     notion.py          add_task, add_grocery, query_open_tasks, complete_task
-    weather.py         current conditions + daily forecast
     llm.py             LLM client wrapper + cost accounting. Tool *schemas* live in
                        agent/tools.py beside the implementations they describe, so
                        the two cannot drift apart
@@ -178,7 +175,7 @@ when natural language misfires.
 /todo add <text> [due] [priority]     /todo list     /todo done <query>
 /grocery add <item> [qty]             /grocery list  /grocery got <query>
 /event <title> <when> [duration]      /agenda [day]
-/weather [day]                        /brief
+/brief
 ```
 
 **Layer 1 — Deterministic fast-path.** Regex + keyword matching on plain messages.
@@ -190,7 +187,6 @@ This is the cost lever: it should catch the majority of daily traffic.
 | `remind me to <x>`, `todo: <x>`, `add <x> to my todo` | `task.add` |
 | `what's on my plate`, `what do i have (today\|tomorrow)` | `agenda.read` |
 | `done: <x>`, `finished <x>`, `got <x>` | `task.complete` / `grocery.check` |
-| `weather`, `forecast`, `is it going to rain` | `weather.read` |
 | Bare list lines posted in `#groceries` | `grocery.add` |
 
 `done` and `got` take a **substring of the item**, not a list index. An index looks
@@ -212,7 +208,7 @@ exactly one implementation of "create an event."
 
 Tools exposed: `create_calendar_event`, `list_calendar_events`, `add_task`,
 `list_tasks`, `complete_task`, `add_grocery_item`, `list_groceries`,
-`check_off_grocery`, `get_weather`, `build_daily_schedule`.
+`check_off_grocery`, `build_daily_schedule`.
 
 **Write actions get a confirmation step.** Calendar writes and any multi-item batch
 render as an embed with ✅/❌ reactions before executing. Reads execute immediately.
@@ -225,7 +221,7 @@ do not optimize it away to save a round trip.
 
 ## 5. Daily jobs
 
-Three scheduled capabilities, all driven by the Task Scheduler (APScheduler,
+Two scheduled capabilities, all driven by the Task Scheduler (APScheduler,
 in-process — no dependency on Windows Task Scheduler, and it survives the move to
 a VPS unchanged).
 
@@ -236,29 +232,17 @@ LLM last** — gap-finding is arithmetic, not judgment:
 
 1. Pull today's Google Calendar events (busy blocks).
 2. Pull open Notion tasks: overdue, due today, or high-priority with no due date.
-3. Pull today's weather (§5b) for the header line.
-4. Compute free gaps between busy blocks inside waking hours (default 08:00–22:00),
+3. Compute free gaps between busy blocks inside waking hours (default 08:00–22:00),
    discarding gaps shorter than 20 minutes.
-5. Greedily fit tasks into gaps by `(priority DESC, due_date ASC)`, using each
+4. Greedily fit tasks into gaps by `(priority DESC, due_date ASC)`, using each
    task's `Estimate` (default 30 min when unset).
-6. **One** LLM call turns that structure into readable prose and flags conflicts or
+5. **One** LLM call turns that structure into readable prose and flags conflicts or
    an over-committed day. If the call fails, fall back to a plain template — the
    brief must never fail to post because of an API error.
 
 The same code path serves `/brief` on demand.
 
-### 5b. Weather update
-
-Current conditions and the day's forecast, fetched once each morning and cached in
-SQLite for the rest of the day so `/weather` and the brief share one fetch.
-
-Rain or a temperature swing is the one weather fact that changes behavior, so the
-brief surfaces those and stays quiet otherwise. **No LLM call** — this is a
-formatted API response.
-
-Provider is not yet chosen; see §14.
-
-### 5c. Reminders
+### 5b. Reminders
 
 Distinct from the brief: the brief is one 07:00 summary, reminders are nudges
 through the day. A poll every 15 minutes, entirely deterministic:
@@ -320,10 +304,9 @@ Category is auto-assigned by the fast-path from a static keyword map
 
 | Table | Purpose |
 |---|---|
-| `messages` | Discord message ID -> resolved intent -> resulting Notion/GCal ID. Powers idempotency. **Not yet sufficient for undo:** the Discord message id is the primary key, so a confirmed multi-write batch (Layer 2 can propose one) overwrites its own row and only the last write survives. Phase 9 needs a row per write before ❌-undo can be honest |
+| `messages` | Discord message ID -> resolved intent -> resulting Notion/GCal ID. Powers idempotency. **Not yet sufficient for undo:** the Discord message id is the primary key, so a confirmed multi-write batch (Layer 2 can propose one) overwrites its own row and only the last write survives. Phase 8 needs a row per write before ❌-undo can be honest |
 | `briefs` | One row per generated brief; prevents double-posting after a restart |
 | `reminders_fired` | One row per delivered reminder; prevents double-notifying after a restart |
-| `weather_cache` | One row per day; keeps the morning fetch serving `/weather` all day |
 | `conversations` | Rolling short-term context for Layer 2 multi-turn. **Not built** — Layer 2 is single-turn, and a rolling context multiplies both tokens and prompt-injection surface for no demonstrated need |
 | `llm_spend` | One row per local day: tokens and USD. Backs the §11 spend guard |
 | `cache` | Notion database schema cache, so properties aren't re-fetched every call |
@@ -351,8 +334,6 @@ enough, and this is the single most common reason a Notion call returns 404.
 **Discord — bot token + MESSAGE CONTENT INTENT.** The intent is privileged but
 self-serve for bots in under 100 servers. Without it, `message.content` arrives
 empty and Layer 1 never fires.
-
-**Weather — TBD**, pending the provider decision in §14.
 
 **Everything is allowlisted to one person's Discord user IDs.** `DISCORD_OWNER_USER_ID1`
 is required and `DISCORD_OWNER_USER_ID2` is optional, so one human running two accounts
@@ -425,7 +406,7 @@ The §11 figures were re-baselined against OpenAI's published pricing at the sam
 ## 11. Cost model
 
 Layers 0 and 1 are free. Only Layer 2 and the daily brief cost anything.
-Reminders and the weather update are deterministic and cost nothing.
+Reminders are deterministic and cost nothing.
 
 The lever that matters is fast-path hit rate, not model choice — every message
 Layer 1 catches is a request that never happens. That holds regardless of provider.
@@ -469,14 +450,13 @@ Each phase also ends with a §9 review pass.
 | **4** | Calendar write | `/event` creates events, behind the ✅ confirmation |
 | **5** | LLM fallback | Layer 2 tool-use loop. Resolve §10 first |
 | **6** | Daily brief | Task Scheduler posts to `#daily-brief` at 07:00; `/brief` on demand |
-| **7** | Weather | Provider chosen, credential added, `/weather` works, brief header line lands |
-| **8** | Reminders | Appointment lead-time pings and task nudges, idempotent across restart |
-| **9** | Hardening | Retries with backoff, rate-limit handling, errors to `#logs`, undo via ❌ (needs the `messages` rework in §6 first — one row per write, not per Discord message), spend guard (already built in Phase 5) |
-| **10** | Portability | Dockerfile + documented VPS deploy, so the laptop stops being load-bearing |
-| **11** | Control hub (GUI) | A single screen for Jarvis: today's schedule, open tasks, the grocery list, recent activity, and what Layer 2 has cost this month. See §15 |
+| **7** | Reminders | Appointment lead-time pings and task nudges, idempotent across restart |
+| **8** | Hardening | Retries with backoff, rate-limit handling, errors to `#logs`, undo via ❌ (needs the `messages` rework in §6 first — one row per write, not per Discord message), spend guard (already built in Phase 5) |
+| **9** | Portability | Dockerfile + documented VPS deploy, so the laptop stops being load-bearing |
+| **10** | Control hub (GUI) | A single screen for Jarvis: today's schedule, open tasks, the grocery list, recent activity, and what Layer 2 has cost this month. See §15 |
 
 Unit tests (§8) are written alongside each phase, not batched at the end. The
-functional suite lands with Phase 9.
+functional suite lands with Phase 8.
 
 Phase 2 is the one to resist rushing past. A bot that reliably adds groceries at
 zero API cost is already worth having on your phone.
@@ -485,6 +465,8 @@ zero API cost is already worth having on your phone.
 
 ## 13. Explicit non-goals (for now)
 
+- Weather. Dropped, not deferred — it was never built, and the brief is more
+  useful for being one thing done well than two things half-wired.
 - Multi-user support. One allowlisted *person* throughout — who may hold more than one
   Discord account (§7). There is still no per-user data, no separate calendars, and no
   notion of "whose" a task is.
@@ -505,8 +487,6 @@ zero API cost is already worth having on your phone.
   Read here as **To-Do List** — confirm, or rename the node.
 - `Reminders -> Appointments` is drawn twice (two identical edges). Cosmetic; worth
   deleting one so the diagram doesn't imply two distinct paths.
-- Weather provider: which API? This decides a `.env` key, a `SETUP.md` section, and
-  whether the free tier covers a once-daily fetch.
 
 **Carried over:**
 
@@ -515,13 +495,13 @@ zero API cost is already worth having on your phone.
 - Do groceries need a "shopping trip" concept, or is a flat checked/unchecked list enough?
 - Appointment reminder lead time — 30 minutes is a placeholder, and it probably
   wants to vary by whether travel is involved.
-- **Phase 11's hub: native desktop or local web app?** It interacts with Phase 10 —
+- **Phase 10's hub: native desktop or local web app?** It interacts with Phase 9 —
   a native app assumes Jarvis runs on the same machine, so moving to a VPS would then
-  need an API built for it. Decide once Phase 10 is real, not before. See §15.
+  need an API built for it. Decide once Phase 9 is real, not before. See §15.
 
 ---
 
-## 15. Control hub (Phase 11)
+## 15. Control hub (Phase 10)
 
 A GUI that acts as the central place to see and steer Jarvis, rather than a second
 way to type at it. Discord stays the conversational interface — this is the dashboard
@@ -554,13 +534,13 @@ Discord is bad at: state at a glance instead of a scrollback.
 
 ### The decision that shapes it
 
-**Native desktop or local web app**, and it interacts with Phase 10. A native app
+**Native desktop or local web app**, and it interacts with Phase 9. A native app
 talks to a bot on *this* laptop fine, but the moment Jarvis moves to a VPS it needs an
 API to talk to — so choosing native quietly adds a server phase later. A local web app
 (FastAPI serving a small page, or the same served from the VPS behind auth) costs a
 little more now and nothing later.
 
-Deferred deliberately until Phase 10 is real, because where Jarvis runs decides what
+Deferred deliberately until Phase 9 is real, because where Jarvis runs decides what
 the hub can be. Flagged in §14.
 
 ---
