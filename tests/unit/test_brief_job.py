@@ -26,48 +26,9 @@ from Jarvis.scheduler import jobs, planner
 from Jarvis.storage.models import brief_posted, record_brief
 from Jarvis.utils.dates import now_local
 
-from tests.conftest import FAKE_ENV
+from tests.conftest import FAKE_ENV, FakeBot
 
 BRIEF_CHANNEL = int(FAKE_ENV["DISCORD_BRIEF_CHANNEL_ID"])
-
-
-class FakeChannel:
-    def __init__(self, raises: Exception | None = None) -> None:
-        self.sent: list[str] = []
-        self.raises = raises
-
-    async def send(self, content: str) -> None:
-        if self.raises is not None:
-            raise self.raises
-        self.sent.append(content)
-
-
-class FakeBot:
-    """Only what the job touches: wait_until_ready, get_channel, fetch_channel."""
-
-    def __init__(self, *, cached: bool = True, raises: Exception | None = None) -> None:
-        self.channel = FakeChannel(raises)
-        self.cached = cached
-        self.asked: list[int] = []
-        self.fetched: list[int] = []
-        self.sent_before_ready: int | None = None
-
-    async def wait_until_ready(self) -> None:
-        # Recorded, not just counted: posting into a client that is still connecting is
-        # a brief lost, so the ordering is the thing worth asserting.
-        self.sent_before_ready = len(self.channel.sent)
-
-    def get_channel(self, channel_id: int):
-        self.asked.append(channel_id)
-        return self.channel if self.cached else None
-
-    async def fetch_channel(self, channel_id: int):
-        self.fetched.append(channel_id)
-        return self.channel
-
-    @property
-    def sent(self) -> list[str]:
-        return self.channel.sent
 
 
 def post(bot: FakeBot) -> None:
@@ -280,32 +241,6 @@ def test_the_brief_is_a_read_not_a_write():
 # --- the schedule itself ----------------------------------------------------
 
 
-@pytest.fixture
-def scheduler(monkeypatch) -> dict:
-    """Capture what would have been handed to APScheduler. Nothing is really scheduled."""
-    made: dict = {}
-
-    class FakeScheduler:
-        def __init__(self, **kwargs):
-            made["scheduler"] = kwargs
-            made["instance"] = self
-            self.started = False
-            self.shutdown_wait = "never called"
-
-        def add_job(self, func, trigger, **kwargs):
-            made["job"] = dict(kwargs, func=func, trigger=trigger)
-
-        def start(self):
-            self.started = True
-
-        def shutdown(self, wait=True):
-            self.shutdown_wait = wait
-
-    monkeypatch.setattr(jobs, "AsyncIOScheduler", FakeScheduler)
-    monkeypatch.setattr(jobs, "CronTrigger", lambda **kwargs: made.setdefault("cron", kwargs))
-    return made
-
-
 def test_the_brief_is_scheduled_in_the_configured_zone_not_utc_and_not_the_machines(monkeypatch, scheduler):
     monkeypatch.setenv("TIMEZONE", "Asia/Tokyo")  # deliberately neither UTC nor this machine
     monkeypatch.setenv("DAILY_BRIEF_TIME", "06:45")
@@ -330,7 +265,7 @@ def test_the_default_brief_time_is_what_config_ships(scheduler):
 def test_a_loop_busy_at_0700_does_not_silently_drop_the_brief(scheduler):
     jobs.start(FakeBot())
 
-    job = scheduler["job"]
+    job = scheduler["jobs"][jobs.JOB_ID]
     assert job["func"] is jobs._post_brief
     assert job["misfire_grace_time"] >= 60, "APScheduler's one-second default drops a late run"
     assert job["coalesce"] is True, "one catch-up run, never a backlog of them"

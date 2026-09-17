@@ -32,6 +32,8 @@ class Config:
     waking_hours_end: int
     min_schedulable_gap_minutes: int
     default_task_estimate_minutes: int
+    reminder_lead_minutes: int
+    reminder_poll_minutes: int
     daily_brief_time: str  # "HH:MM" local
     timezone: str
     db_path: str
@@ -84,10 +86,17 @@ _INT_KEYS = (
 )
 _FLOAT_KEYS = ("LLM_DAILY_SPEND_LIMIT_USD",)
 
+# Reminders (plan.md section 5b). Optional, unlike the brief's numbers: this phase
+# shipped after the .env was written, and a missing key means the default rather than a
+# startup failure. Present but unparseable still fails loudly, like everything else.
+_REMINDER_DEFAULTS = {"REMINDER_LEAD_MINUTES": 30, "REMINDER_POLL_MINUTES": 15}
+
 # One human, two Discord accounts. ID1 is required; further accounts are optional, so a
 # single-account setup needs no placeholder. Add ID3 here if a third ever shows up.
 _OWNER_KEYS = ("DISCORD_OWNER_USER_ID1", "DISCORD_OWNER_USER_ID2")
-_OPTIONAL_INT_KEYS = tuple(k for k in _OWNER_KEYS if k not in _REQUIRED)
+_OPTIONAL_INT_KEYS = tuple(k for k in _OWNER_KEYS if k not in _REQUIRED) + tuple(
+    _REMINDER_DEFAULTS
+)
 
 
 @lru_cache(maxsize=1)
@@ -138,6 +147,11 @@ def get_config() -> Config:
             ints[key] = int(value)
         except ValueError:
             problems.append(f"{key} (not an integer)")
+    # Absent means the default. Zero or negative would mean "remind me never" or a hot loop.
+    for key, default in _REMINDER_DEFAULTS.items():
+        ints.setdefault(key, default)
+        if ints[key] < 1:
+            problems.append(f"{key} (must be a positive number of minutes)")
 
     if problems:
         raise SystemExit(
@@ -164,6 +178,8 @@ def get_config() -> Config:
         waking_hours_end=ints["WAKING_HOURS_END"],
         min_schedulable_gap_minutes=ints["MIN_SCHEDULABLE_GAP_MINUTES"],
         default_task_estimate_minutes=ints["DEFAULT_TASK_ESTIMATE_MINUTES"],
+        reminder_lead_minutes=ints["REMINDER_LEAD_MINUTES"],
+        reminder_poll_minutes=ints["REMINDER_POLL_MINUTES"],
         daily_brief_time=raw["DAILY_BRIEF_TIME"],
         timezone=os.getenv("TIMEZONE", "").strip() or "America/New_York",
         db_path=os.getenv("DB_PATH", "").strip() or "jarvis.db",

@@ -1564,3 +1564,407 @@ calendar," removes the attractive nuisance while it's still free to remove.
 556/556 tests pass; the always-posts guarantee and the double-post guard are
 both genuinely load-bearing per the mutation check and the test-quality
 review above.
+
+---
+
+# Phase 7 Review — reminders — 2026-09-17
+
+Scope: reminders only. Read `plan/plan.md` §5b, §6, §12 fresh (weather is gone,
+Phase 7 is now reminders); new/changed `Jarvis/scheduler/reminders.py`,
+`Jarvis/scheduler/jobs.py`, `Jarvis/storage/models.py`, `Jarvis/storage/db.py`,
+`Jarvis/config.py`; `tests/unit/test_reminders.py`, `test_reminder_job.py`,
+`tests/conftest.py`. Also read `planner.py` and `utils/dates.py` for the
+sibling-module and duplication questions. Ran `python -m pytest tests/ -q`:
+**642 passed**, 0 failed. No OpenAI call made, `.env`/`secrets/` untouched, no
+git command run, nothing under `Jarvis/` or `tests/` edited — the only write is
+this log.
+
+## Findings
+
+### MEDIUM
+
+**P7-M1 — `due_tasks`'s `lead_minutes` default is dead weight in production and
+an unforced inconsistency with its two siblings.**
+`Jarvis/scheduler/reminders.py:75-77`:
+```python
+def due_tasks(
+    tasks: list[Task], now: datetime, *, lead_minutes: int = DEFAULT_LEAD_MINUTES
+) -> list[Reminder]:
+```
+`due_appointments` (line 53) and `end_of_day` (line 101) — the other two "pure
+functions over data" the module docstring groups `due_tasks` with — both make
+their threshold argument keyword-only with **no** default; only `due_tasks` got
+one. Checked every call site: `due_now` (the one production caller of all
+three) always passes `lead_minutes=lead` explicitly, never relying on the
+default. `tests/unit/test_reminders.py` never omits `lead_minutes` for
+`due_tasks` either (grepped all five call sites — all pass `lead_minutes=LEAD`).
+The *only* place the default is actually used is two lines inside
+`reminders.py`'s own `__main__` self-check (lines 190-191:
+`due_tasks([task(due=...)], NOW) == []`), where `due_appointments` in the
+identical self-check always passes `lead_minutes=30` explicitly instead
+(lines 173-178) — so the self-check didn't even need the default consistently;
+it just happened to take the shortcut for one sibling and not the other.
+**Fix:** drop `= DEFAULT_LEAD_MINUTES` from `due_tasks`'s signature (making it
+`lead_minutes: int` like its two siblings) and delete `DEFAULT_LEAD_MINUTES`,
+adding `lead_minutes=30` to the two self-check lines that currently omit it.
+This closes a real, if narrow, hazard: a future call site that forgets to
+thread the user's configured lead through `due_tasks` today fails silently
+(gets a hard-coded 30 that may not match `REMINDER_LEAD_MINUTES`), while the
+identical mistake against `due_appointments` or `end_of_day` is a loud
+`TypeError` at the call site. Uniform keyword-required arguments across all
+three siblings make that class of mistake impossible instead of possible-only-
+for-one-of-three.
+
+**P7-M2 — Three copies of the same local-clock format string.**
+`Jarvis/utils/dates.py:56-58`:
+```python
+def format_span(start: datetime, end: datetime) -> str:
+    return f"{to_local(start):%I:%M%p}-{to_local(end):%I:%M%p}"
+```
+`Jarvis/scheduler/reminders.py:48-50`:
+```python
+def _at(when: datetime) -> str:
+    return f"{to_local(when):%I:%M%p}"
+```
+The literal `%I:%M%p` format spec appears three times (twice inside
+`format_span`, once in `reminders._at`) instead of once. This is exactly the
+"third copy of local-time rendering" question 4 asked about — it exists.
+**Fix:** add a single-timestamp formatter to `utils/dates.py` next to
+`format_span` (e.g. `def clock(dt: datetime) -> str: return
+f"{to_local(dt):%I:%M%p}"`), rewrite `format_span` as
+`f"{clock(start)}-{clock(end)}"`, and have `reminders._at` become `return
+clock(when)` (or just import and use `clock` directly, deleting `_at`). One
+format string instead of three; `format_span`/`_at` keep their names and
+call-site behavior is unchanged.
+
+### LOW
+
+**P7-L1 — The same fallible-read-and-continue shape is written out four times
+across the two sibling modules.**
+`Jarvis/scheduler/planner.py:83-93` (calendar, then tasks) and
+`Jarvis/scheduler/reminders.py:136-148` (calendar, then tasks) each have:
+```python
+try:
+    ...  # call the integration, use the result
+except Exception as exc:  # noqa: BLE001 - ...
+    log.error("<label> (%s)", type(exc).__name__)
+```
+four times, identical in shape (call one fallible integration function, on any
+exception log a label plus the exception's type name only, fall back to an
+empty/partial result, never re-raise), differing only in the label string and
+the fallback value already in scope. A four-line
+`_safe(label, fn, default)` helper in `utils/logging.py` (which both modules
+already import `get_logger` from) would collapse this to one call per site.
+**Not blocking** — four call sites, each already three lines and clearly
+commented (the `noqa: BLE001` comment on each is itself repeated four times,
+which is a small tell that this is the same block copy-pasted rather than four
+independent decisions) — but worth doing the next time either file is opened
+for something else, since a fifth copy is exactly how this stops looking
+worth extracting.
+
+**P7-L2 — `reminders_fired`'s "delivered" wording is inaccurate given the
+claim/no-release asymmetry (ties to the P7 ruling on item 2 below), in two
+places.**
+`plan/plan.md:309`: `` `reminders_fired` | One row per delivered reminder;
+prevents double-notifying after a restart ``. `Jarvis/storage/db.py:27-29`
+carries the identical phrase in the schema comment: "One row per reminder
+already delivered." Both predate the deliberate design in
+`Jarvis/scheduler/jobs.py:165-178`, where a reminder that is claimed but then
+fails to *send* (Discord raises) still leaves its row in `reminders_fired` —
+confirmed by `tests/unit/test_reminder_job.py::test_a_failed_send_does_not_release_a_reminders_claim`,
+which asserts `fired() == ["appt:e1"]` even though `bot.sent == []` in that
+test. "Delivered" overstates what the row actually guarantees; the row means
+"claimed for sending," not "successfully sent." **Fix:** reword both to "one
+row per reminder claimed for sending" or similar. Cosmetic — no behavior
+depends on the wording — but it is the one place the asymmetry ruled on below
+isn't accurately described anywhere in prose.
+
+**P7-L3 — `get_config()`'s body is now ~90 lines of sequential validation
+blocks.** `Jarvis/config.py:102-186`: required-key presence, int parsing,
+float parsing, waking-hours-window sanity, positive-minutes checks, brief-time
+format, optional-key parsing, then reminder defaults — eight distinct concerns
+in one function. Every block is short, well-commented, and independently
+correct (confirmed by `test_config.py`'s per-concern test groups, which map
+almost one-to-one onto the blocks). Not a defect, and CLAUDE.md's "reads .env
+once" constraint is satisfied regardless of internal shape, but the function
+is long enough now that pulling the reminder-specific block and the
+scheduler-arithmetic block into two small named helpers (`_validate_scheduler`,
+`_validate_reminders`, each taking and returning `(ints, problems)`) would make
+the next addition (Phase 8 has none named, but the pattern will repeat) land
+as a new four-line helper instead of eight more lines wedged into one
+function. Optional, not urgent.
+
+No HIGH findings.
+
+## Ruling on item 1 — is §5b still accurate, and the exact reword
+
+Checked every clause against the code, not against memory of the plan:
+
+- **"a poll every 15 minutes"** — no longer accurate. `REMINDER_POLL_MINUTES`
+  is a config key (`Jarvis/config.py:92`, default 15) and
+  `Jarvis/scheduler/jobs.py:65,74` builds the `IntervalTrigger` and its misfire
+  grace from `cfg.reminder_poll_minutes`, not a literal 15.
+  `test_the_poll_runs_on_an_interval_in_the_configured_zone` locks this in
+  directly. **Needs reword.**
+- **"Appointments — DM or `#inbox` ping"** — half accurate. Every reminder
+  send in the code goes through `_post(bot, text, get_config().discord_inbox_channel_id)`
+  (`jobs.py:168`); there is no DM path anywhere — grepped `Jarvis/` for
+  `dm_channel`/`create_dm`/`send_dm`, no hits outside an unrelated comment in
+  `bot/handlers.py` about reaction events. Only `#inbox` is implemented.
+  **Needs reword** — either drop "DM or" or add a one-line note that DM
+  delivery isn't built.
+- **"at a configurable lead time (default 30 minutes)"** — accurate.
+  `REMINDER_LEAD_MINUTES` defaults to 30 (`config.py:92`) and
+  `due_appointments`'s window (`reminders.py:61`,
+  `now < event.start <= now + lead_minutes`) matches exactly. No change
+  needed.
+- **"Tasks — a nudge for anything due today still marked `Not started`... plus
+  a single end-of-day sweep for what slipped"** — accurate as written. The
+  nudge clause correctly scopes to `Not started` only (`due_tasks` checks
+  `task.status != NOT_STARTED`, line 91); the sweep clause makes no status
+  claim of its own and the code's broader "open, not just not-started" sweep
+  scope (`end_of_day`, line 112: `t.status != DONE`) is consistent with the
+  plain English "what slipped" — no reword needed here.
+- **"Every fired reminder is recorded in SQLite so a restart cannot
+  double-notify"** — accurate in effect (confirmed by
+  `test_a_restart_does_not_re_ping_what_the_last_process_already_sent` and
+  `test_a_reminder_claim_survives_a_restart`), though see P7-L2 above for the
+  adjacent §6 table description overstating "delivered."
+- **"No LLM call — the trigger is a timestamp comparison and the message is a
+  template"** — accurate, and directly tested
+  (`test_a_poll_full_of_reminders_never_calls_the_llm`).
+
+**Exact reword for §5b's opening and first bullet:**
+
+> Distinct from the brief: the brief is one 07:00 summary, reminders are
+> nudges through the day. A poll at a configurable interval (default 15
+> minutes, `REMINDER_POLL_MINUTES`), entirely deterministic:
+>
+> - **Appointments** — a `#inbox` ping at a configurable lead time (default 30
+>   minutes, `REMINDER_LEAD_MINUTES`) before a calendar event starts. (DM
+>   delivery is not implemented; every reminder posts to
+>   `DISCORD_INBOX_CHANNEL_ID`.)
+> - **Tasks** — a nudge for anything due today still marked `Not started` as
+>   its due time approaches, plus a single end-of-day sweep for what slipped.
+
+The second bullet needs no change; only the preamble and the first bullet do.
+
+## Ruling on item 2 — the claim/release asymmetry: comprehensible, or does it
+need to be structural?
+
+**Comprehensible as written; do not restructure it into something uniform.**
+Three separate things carry the "why," not one comment doing all the work:
+
+1. The module docstring (`jobs.py:6-9`) flags the asymmetry exists and points
+   forward: "Both claim before they send, and they differ deliberately on what
+   a failed send means — see `_poll_reminders`."
+2. `_post_brief` (line 106) explains why it releases (there is exactly one
+   brief a day; losing it is the Phase-6 failure mode; a duplicate is cheaper
+   than a gap).
+3. `_poll_reminders` (line 169) explains the opposite in an ALL-CAPS-flagged
+   comment naming `_post_brief` directly and stating the reasoning in the
+   opposite direction (many reminders, tied to a near-past moment, duplicate
+   worse than missed).
+
+That is bidirectional signposting — either function, read in isolation, tells
+you to go look at the other one, and both give the reasoning rather than just
+the fact. More importantly, the asymmetry is **also enforced structurally, not
+just narrated**: there is no `release_reminder` function at all.
+`Jarvis/storage/models.py:118-121` says so outright ("There is no
+release_reminder on purpose") — a future maintainer who decided the brief's
+behavior should be copied onto the reminder path would have to *write a new
+storage function* to do it, not just delete a line. That's a real forcing
+function, not a comment that can bit-rot silently while the code drifts back
+into symmetry. Collapsing the two into one shared "claim, send, maybe release"
+helper with a boolean flag (`release_on_failure: bool`) would make things
+*more* opaque, not less: the reasoning above is exactly the kind of context a
+boolean can't carry, and a reader would have to chase the flag back to its
+call site to recover what the inline comments state directly today. Given
+CLAUDE.md's own bias against unrequested abstraction for a single conceptual
+distinction with exactly two call sites, two plain functions with cross-
+referenced comments is the better shape, not a compromise. **Verdict: leave
+it. The asymmetry is intentional, well-argued at both sites, and one half of
+it is impossible to accidentally reverse because the function to reverse it
+with doesn't exist.**
+
+## Ruling on item 3 — `due_tasks(tasks, now, *, lead_minutes: int = 30)` vs.
+the contracted `due_tasks(tasks, now)`
+
+**The core call was right; the specific default is not (see P7-M1).** The
+underlying decision — extend the contracted signature with an explicit
+keyword-only parameter sourced from config, rather than either hard-coding 30
+inside a function the module docstring insists is "pure... no config of its
+own," or having the pure function reach into `get_config()` itself — is
+correct and is the same pattern `due_appointments` and `end_of_day` both use
+for their own thresholds (`lead_minutes`, `end_hour`). A contract written
+before `REMINDER_LEAD_MINUTES` existed as a configurable value can't have
+anticipated it; growing the signature to accept what config now provides,
+rather than quietly ignoring the user's setting, is the only choice that
+keeps "the user's configured lead" actually meaning something. Accepting the
+deviation was right.
+
+Where I'd push back is the implementation detail, not the decision: giving
+*only* `due_tasks` a default value that production code never exercises
+(P7-M1) wasn't part of what made the deviation necessary — a bare `lead_minutes:
+int` keyword-only parameter, with no default, would have satisfied the exact
+same "don't hard-code 30, don't read config from a pure function" reasoning
+just as well, and would have kept the three sibling functions uniform. So:
+right call to deviate, right reason to deviate, but tighten the deviation
+itself per P7-M1 rather than treating the default as part of what was
+approved.
+
+## Ruling on item 4 — `reminders.py`/`planner.py` shape, and the duplication
+hunt
+
+**The "pure functions + one impure wrapper" parallel structure is genuine, not
+duplication to collapse.** Different domains (a schedule to build vs. nudges
+to fire), different data shapes (`Plan` vs. `Reminder`), different failure
+handling requirements (the brief must always produce *something*; a reminder
+either fires or doesn't) — forcing them under a shared base or a generic
+`build(day_or_now) -> T` interface would cost a layer of indirection to save
+a resemblance that's already this review's fourth time ruling the same way on
+parallel modules (pass 1's `todo.py`/`grocery.py`, cycle 2's `bot/commands/*`).
+Consistent with that precedent: leave the two modules as siblings.
+
+What *is* real duplication, found by actually diffing the two files rather
+than eyeballing their shape: **P7-M2** (three copies of the same clock format
+string — the specific thing this item asked me to check for) and **P7-L1**
+(the four-times-repeated fallible-read-log-and-continue block). Both are
+small, both have a one-line fix named above, neither is urgent.
+
+## Ruling on item 5 — Config's growth and the required/optional split
+
+**Still one coherent thing; not worth splitting yet.** 24 fields (not 23 —
+recounted from the dataclass directly), but every field is the same kind of
+thing (a value read from `.env`, validated once, frozen), and the naming
+convention (`discord_*`, `notion_*`, `google_*`, `openai_*`, plus the
+brief/reminder/scheduler arithmetic knobs) already gives readers the grouping
+a set of nested `DiscordConfig`/`NotionConfig` sub-dataclasses would provide,
+without the churn of rewriting every `cfg.discord_inbox_channel_id`-style
+call site across the tree into `cfg.discord.inbox_channel_id`. No call site
+threads an unrelated slice of `Config` through business logic that only needs
+one corner of it (`jobs._brief_time(cfg: Config)` taking the whole object
+just to read two fields is the closest thing to that smell, and it's minor).
+Split it when a real pain point shows up — e.g. a second bot needing only the
+Discord fields, or a test wanting to construct a partial config — not
+preemptively. **P7-L3** above is the one growth-related item worth acting on,
+and it's about `get_config()`'s internal validation structure, not `Config`'s
+shape.
+
+**The required-vs-optional split (brief's numbers required, reminder's
+optional-with-defaults) is justified, not accidental.** `config.py:89-91`
+states the reason plainly: Phase 7 shipped after users already had a working
+`.env`, and a missing key should mean "use the shipped default," not "refuse
+to boot." This is the same policy already established for
+`DISCORD_OWNER_USER_ID2` (optional, defaults to absent) extended consistently
+to `REMINDER_LEAD_MINUTES`/`REMINDER_POLL_MINUTES` (optional, defaults to
+30/15) — not a new pattern invented ad hoc. It's tested from both directions:
+absent means the shipped default
+(`test_the_reminder_keys_are_optional_and_default_to_the_shipped_numbers`),
+present-but-garbage still fails loudly rather than silently keeping the
+default (`test_a_present_but_unparseable_reminder_key_fails_loudly`), and
+zero/negative is rejected the same way a required field's bad value would be
+(`test_a_reminder_interval_of_zero_or_less_is_rejected`). A newly-required key
+would break every existing installation's `.env` on upgrade for no benefit;
+an optional key with a validated default gets the same safety with none of
+the breakage. Right call.
+
+## Test quality (item 6)
+
+**Good, not over-sharing.** `FakeChannel`/`FakeBot`/the `scheduler` fixture
+moved to `tests/conftest.py` (from wherever `test_brief_job.py` presumably had
+them alone before) because there are now genuinely two consumers —
+`test_brief_job.py` and `test_reminder_job.py` — both driving the same
+`Jarvis.scheduler.jobs` module through the same kind of bot double and the
+same APScheduler-capture trick. This is reuse against an actual second caller
+that exists today, not a speculative shared fixture built ahead of need — the
+same bar this review has applied to code duplication throughout (extract only
+once there's a real second user). Read all of `test_reminder_job.py` for
+what's actually asserted: every test that matters asserts on `bot.sent`,
+`bot.asked`, `bot.fetched`, or `fired()` (a direct `SELECT key FROM
+reminders_fired` against the real sqlite file) — never on `_poll_reminders`'s
+return value, which is `None` and asserted on by exactly zero tests. The two
+tests pinning the asymmetry from item 2
+(`test_a_failed_send_does_not_release_a_reminders_claim`,
+`test_a_failed_brief_post_does_release_its_day`) are both mutation-provable:
+removing `_release(day)` from `_post_brief` fails the second test
+immediately, and adding a `release_reminder` call to `_poll_reminders` would
+fail the first (`fired() == ["appt:e1"]` would become `[]`). Confirmed by
+reading the code path each depends on, not just by the docstring's claim to
+that effect.
+
+## Ruling on item 7 — the idempotency key scheme, and the reschedule
+limitation
+
+**Scheme is right for the stated policy, and the limitation is disclosed
+honestly rather than swept under a comment.** `appt:{event_id}` (once ever),
+`task:{id}:{date}` (once per local day), `sweep:{date}` (once per local day)
+each key exactly the rate limit the corresponding function needs — confirmed
+against `tests/unit/test_storage.py`'s
+`test_distinct_keys_are_distinct_claims` and the concurrent-claim tests, which
+exercise all three shapes under real thread contention and find no collision.
+No parsing ever happens on these keys after they're written (checked: they're
+only ever compared for existence via `INSERT ... ON CONFLICT DO NOTHING`), so
+the colon-delimited shape is purely for a human reading the table, not load-
+bearing for correctness.
+
+The reschedule gap (`storage/models.py:114-116`, ponytail-tagged with the
+upgrade path already named) is a genuine trade-off, not a free improvement
+left on the table. The tempting alternative — fold the event's start time
+into the key (`appt:{id}:{start_iso}`) — would fix the reschedule case but
+introduces the opposite risk: if the upstream Calendar API ever returns a
+slightly different string representation of an *unchanged* start time across
+two polls (a timezone-offset formatting difference, a fractional-second
+artifact), that alone would manufacture a new key and cause a duplicate ping
+for an event that never moved. The id-only key is deliberately biased toward
+"trust the id, risk missing a reschedule" — which is the *same* value
+judgment already made explicitly for send failures in item 2 (a duplicate
+ping is worse than a missed one, stated identically in both
+`jobs.py:174-176` and `models.py:120`). This isn't a separate, unexamined
+default; it's the same policy applied consistently to a second decision.
+**Verdict: right scheme, right trade, and it's the one place the documented
+limitation and the actual behavior fully agree with each other** — the
+`ponytail:` comment names the exact cost (a moved event won't re-ping) and the
+exact fix (put the start time in the key) rather than describing a
+different or softer version of the limitation.
+
+## Verdict on the four review questions
+
+1. **Unnecessarily repeated blocks of code?** Two small, real ones (P7-M2's
+   triple `%I:%M%p`, P7-L1's four-times-repeated fallible-read pattern), both
+   with a one-line fix, neither urgent. The parallel module structure
+   (`reminders.py`/`planner.py`) is genuine, not duplication (item 4 ruling).
+2. **Helper functions for modularity?** Yes where it matters — `_post`,
+   `_claim`/`_release` (brief) and `_claim_reminder` (reminders, deliberately
+   asymmetric) each do one thing, and `due_appointments`/`due_tasks`/
+   `end_of_day` cleanly separate the three nudge types from the one impure
+   `due_now` wrapper that reads config and two providers. The one signature
+   inconsistency among helpers is P7-M1, not a missing helper.
+3. **Does the code do what it promises?** Yes, on every property tested:
+   fires once ever across overlapping polls and restarts, never calls the
+   LLM, both jobs survive a dead provider independently, and the claim/release
+   asymmetry behaves exactly as documented in both directions
+   (`test_a_failed_send_does_not_release_a_reminders_claim` and
+   `test_a_failed_brief_post_does_release_its_day`, in the same file on
+   purpose). No promise-break found.
+4. **Does the project match the plan?** Not quite, in one place: §5b's poll
+   interval and delivery channel are stale against the now-configurable poll
+   and the DM path that was never built (item 1's reword, above). Everything
+   else in §5b, all of §6's reminder row save the "delivered" wording
+   (P7-L2), and §12's Phase 7 line match the code as built.
+
+## Phase-8 readiness
+
+**Clear to start.** No HIGH or blocking findings. P7-M1 and P7-M2 are the two
+worth doing before or during Phase 8 (both are one-line-signature and one-
+function extractions respectively, neither touches behavior); P7-L1 through
+P7-L3 are optional cleanups for whenever those files are next opened. None of
+the five findings touch what Phase 8 (hardening: retries/backoff, rate-limit
+handling, errors to `#logs`, undo, the spend guard already built) would build
+on — the claim/release asymmetry this review spent the most time on is
+exactly the kind of behavior Phase 8's "retries with backoff" work needs to
+understand correctly before touching either job, and it is documented well
+enough today (item 2 ruling, above) that Phase 8 can build on it without
+re-deriving the reasoning from scratch. 642/642 tests pass; the test-quality
+review above found no return-value-only assertion in either new test file for
+any property this review was asked to check.

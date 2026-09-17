@@ -1439,3 +1439,176 @@ today's brief" command, it should reuse `_claim`/`_release` rather than posting 
 to the channel, so the guard traced here keeps covering it.
 
 ---
+
+## Phase 7 Review — reminders
+
+Scope: `Jarvis/scheduler/reminders.py` (new), `Jarvis/scheduler/jobs.py`
+(`_poll_reminders`/`_claim_reminder`/interval registration), `Jarvis/storage/models.py`
+(`claim_reminder`), `Jarvis/storage/db.py` (`connect`, `reminders_fired`),
+`Jarvis/config.py` (`REMINDER_LEAD_MINUTES`/`REMINDER_POLL_MINUTES`). Suite: 642 passed
+(re-run clean before writing this).
+
+### 1. Runaway cost / runaway calls
+
+No LLM call anywhere in the reminder path, confirmed by reading, not just by trusting
+the test. `reminders.py` imports no `integrations.llm`; `due_appointments`, `due_tasks`,
+`end_of_day` are pure timestamp/string code; `due_now` calls only `gcal.list_events` and
+`notion.list_open_tasks`. `test_reminder_job.py::test_a_poll_full_of_reminders_never_calls_the_llm`
+monkeypatches the real `llm.complete` (not a local stub of `reminders`) and asserts
+`calls == []` after a poll that fires all three kinds of reminder in the same run, a real
+guard, not a tautology.
+
+Overlap/pile-up/loop, all in `jobs.py:63-75`: `max_instances=1` stops a slow poll running
+beside the next one; `coalesce=True` collapses a backlog from a sleeping laptop into one
+run instead of replaying every missed interval; `misfire_grace_time=reminder_poll_minutes
+* 60` is reasoned about explicitly in the comment (late by less than one interval still
+runs, later than that is skipped, and `due_now` recomputes from the clock either way, so
+nothing is lost by skipping). `_poll_reminders` never raises past its own two try/excepts
+(`due_now` failure, per-reminder `_claim_reminder`/`_post` failures), so APScheduler
+cannot be driven into a retry storm by an exception it never sees.
+
+Fire-once: `claim_reminder` (`models.py:105-130`) is a single `INSERT ... ON CONFLICT(key)
+DO NOTHING` gated on `rowcount == 1`, and there is deliberately no `release_reminder`,
+unlike the brief, a failed send after a successful claim is logged and dropped
+(`jobs.py:169-178`), not retried, which is the correct read of "duplicate ping is worse
+than a missed one" for a nudge. Verdict: clean.
+
+### 2. THE FINDING — shared connection, `with conn:` on a per-thread-shared `sqlite3.Connection`
+
+**Mechanism, confirmed by reading `db.py:44-52` and every writer in `models.py`:**
+`connect()` is `@lru_cache(maxsize=1)`, one `sqlite3.Connection` object,
+`check_same_thread=False`, shared across every thread `asyncio.to_thread` spins up (the
+brief job, the reminder poll, and any Discord command handler that writes). Python's
+`sqlite3` `with conn:` commits or rolls back at the **connection** level, and a single
+SQLite connection has at most one transaction open at a time, so if thread A's INSERT
+opens the implicit transaction and thread B's statement lands before A's block exits,
+both are in the *same* transaction. If B's statement then raises, `with conn:` issues a
+ROLLBACK that discards A's row too, even though A already read `cur.rowcount == 1` and
+told its caller it owns the claim. `claim_reminder` returns `True` again on any later
+poll that still considers that key due, so the message goes out twice.
+
+**But:** every write in this codebase that participates in a `with conn:` block is
+conflict-tolerant by construction: `INSERT OR REPLACE` (`record_message`), `INSERT ...
+ON CONFLICT(day) DO NOTHING` (`record_brief`), `ON CONFLICT(key) DO NOTHING`
+(`claim_reminder`), `ON CONFLICT(day) DO UPDATE` (`record_llm_spend`). None of these
+statements can raise `IntegrityError` from a PK collision, the whole point of using
+upserts here was to make concurrent claims race-safe. Grepped every `with conn:`/`conn.
+execute` in `Jarvis/` (five sites, all in `models.py`); none is a bare INSERT that a
+sibling thread's write could collide with. So the trigger the finding needs, a genuinely
+*failing* write inside another thread's INSERT-to-COMMIT window, has no application-level
+source right now. It would have to come from something exogenous: `sqlite3.
+OperationalError` (disk full, a lock timeout under real contention, though a single
+shared connection mostly avoids the classic multi-connection lock case),
+`KeyboardInterrupt`/`SystemExit` mid-block during shutdown, or a future write that isn't
+upsert-shaped. That makes it real as a mechanism and reachable in principle, but not
+reachable today by any input an attacker, or even normal usage, controls.
+
+**Ruling: it is a correctness/reliability bug, not a security bug**, and it does not
+belong to either of this persona's two review questions, nobody's data is exposed and no
+additional caller gains the ability to invoke Jarvis. It also is not "runaway calls"
+under item 1: the worst case is a **bounded** duplicate Discord send (one extra ping per
+lost claim), not a loop, and it costs no LLM tokens.
+
+**Where it does touch the persona's mandate is cost tracking.** `record_llm_spend` uses
+the identical `with conn:` upsert pattern (`models.py:42-54`). The same mid-air rollback
+could discard an already-billed OpenAI call's `llm_spend` increment, the call and its
+charge already happened, but the local ledger forgets it. That under-counts spend
+against `LLM_DAILY_SPEND_LIMIT_USD`, which is the one place a lost write is more than
+cosmetic: it weakens (never strengthens) the spend guard, by letting real spend run ahead
+of what the guard believes has been spent. It cannot cause runaway calls on its own, the
+guard still checks whatever total it has on the next call, but a string of unlucky
+rollbacks could let the guard under-react. `record_brief`/`release_brief` share the
+mechanism too, but a lost brief claim just reproduces the accepted, documented tradeoff
+from Phase 6 (duplicate brief preferred to a missing one), no new severity there.
+
+**Phase 7's actual contribution:** this bug predates Phase 7 (the pattern has existed
+since `messages`/`llm_spend`/`briefs` shipped), and Phase 7 did not touch `db.py` or the
+transaction pattern. What Phase 7 changed is that *concurrent writers now routinely
+exist*, the poll runs in `asyncio.to_thread` every 15 minutes, overlapping in wall-clock
+time with the brief job and any Discord handler, whereas before this phase the only
+regular writer was Discord command handling (bursty, human-paced, rarely truly
+concurrent with itself). That raises the exposure from theoretical to "will eventually
+overlap," even though it still needs an exogenous failing write to actually manifest.
+
+**Decision: defer to Phase 8, but write it into the plan now**, not silently. Concretely:
+record this exact scenario (duplicate reminder from a rolled-back claim; possible
+`llm_spend` under-count) as a named item in `plan/plan.md`'s hardening/Phase 8 section,
+with the fix already implicit in the existing `ponytail:` comment at `db.py:46-47`
+("give each thread its own connection if writes ever contend"), a per-thread connection
+or a single write-serializing lock around `with conn:` blocks removes the shared-
+transaction hazard entirely. Do not hot-patch it into Phase 7: the fix is a `db.py`-wide
+concurrency change, not a one-line addition to a review that's supposed to be report-
+only, and the trigger condition has no live input path today. Not fixing this before
+merging Phase 7 is acceptable; not writing it down anywhere would not be.
+
+### 3. Unattended delivery — content Jarvis did not compose
+
+`due_appointments` puts `event.title` and `event.location` verbatim into the reminder
+text (`reminders.py:70`); `due_tasks` and `end_of_day` put `task.name` verbatim
+(`reminders.py:97`, `:116`). Both come from the user's own Google Calendar and Notion,
+not a public or third-party input in the normal case, but a calendar invite the user
+accepts from someone else, or a Notion task title typed carelessly, would still reach
+Discord unmodified. `AllowedMentions.none()` is set once on `commands.Bot(...)` in
+`bot/client.py:53-58` and covers every send with no competing `allowed_mentions` kwarg;
+`jobs.py:144`'s `channel.send(text)` (used for both the brief and every reminder) passes
+none, so the global default applies, confirmed by reading the call site, not assumed
+from the earlier phase's log entry. `Reminder.text` is also truncated to `MAX_LEN`
+before it is ever stored as a key or sent (`reminders.py:71`, `:120`), so a maximally
+long title cannot blow past Discord's message cap either. A crafted title can therefore
+make the poll send something odd-looking (markdown, emoji, a fake-looking line) but
+cannot ping `@everyone`/`@here`/a user, cannot execute as a command (the poll never
+routes anything it reads back into `dispatch`), and cannot exceed the length guard. No
+new exposure beyond "the message looks weird," which is the same ceiling Phase 6 already
+accepted for the brief's calendar/task text.
+
+### 4. Credential handling
+
+`due_now`'s two `except Exception` blocks (`reminders.py:140`, `:147`) log
+`type(exc).__name__` only, matching the established pattern; `test_reminders.py::
+test_a_provider_failure_is_logged_by_type_not_by_body` exercises this with a fake
+exception body containing `"hunter2"` and asserts it never reaches `caplog`. `jobs.py`'s
+new logging (`_post`, `_claim_reminder`) logs channel IDs, reminder keys, and day
+strings, none of them secrets, none of them user content. No credential, token, or raw
+provider response is ever interpolated into a log line, a Discord message, or a raised
+exception in the new code. Clean.
+
+### 5. Owner allowlist / confirmation regression
+
+None. The poll (`_poll_reminders`) is scheduled by APScheduler with a fixed argument
+(`bot`) and no Discord identity, exactly like the existing brief job, it is not a command
+path and takes no input from any caller, owner or otherwise, so there is nothing for an
+allowlist to gate. It also never writes to Google Calendar or Notion (read-only:
+`gcal.list_events`, `notion.list_open_tasks`) and never touches a multi-item batch, so
+the confirmation flow is not in scope either, a reminder ping is not a calendar write. No
+new slash command, button, or dispatch path was added this phase that a non-owner could
+reach. Grepped for `dispatch(` and found the reminder path never calls it (unlike the
+brief, which reuses `dispatch(Intent(name="brief.read", ...))`), reminders bypass
+`agent/tools.TOOLS` entirely and go straight from `due_now()` to `channel.send`, which is
+correct: there is no "create a reminder" capability to have two implementations of, only
+a read-and-notify.
+
+### Verdict
+
+**Can someone else access my personal information?** No. Nothing in this phase adds a
+read a non-owner can trigger, and the two providers it reads (Google Calendar, Notion)
+are the same credential-safe wrappers already audited in prior phases.
+
+**Can anyone else make calls to Jarvis?** No. The poll is timer-driven with a fixed
+argument, reachable by nobody over Discord, and never becomes a `dispatch()` call the way
+the brief does.
+
+**Ruling on the shared-connection finding:** real as a mechanism, not reachable today by
+any write actually shipped (every writer is upsert-shaped and cannot raise the
+`IntegrityError` the scenario needs), a correctness/cost-tracking issue rather than a
+confidentiality or access-control one, and worst case is a bounded duplicate ping or an
+under-counted `llm_spend` row, never an unbounded loop. **Defer the fix to Phase 8, but
+record it in `plan/plan.md` now** so it is not lost; do not block Phase 7 on it.
+
+**Safe to leave running unattended every 15 minutes against live accounts?** Yes. No LLM
+cost, no possible overlap or pile-up (`max_instances=1` + `coalesce=True`), each reminder
+fires at most once by an atomic claim, every provider failure is caught and logged by
+type, no credential ever reaches an outbound surface, and the one open correctness
+question (item 2) has a bounded, non-costly, already-understood blast radius. Recommend
+shipping Phase 7 as-is with the plan.md note from item 2 added in the same commit.
+
+---

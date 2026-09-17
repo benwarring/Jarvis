@@ -1,4 +1,5 @@
-"""SQLite connection and schema. Tables: messages (idempotency/undo), llm_spend, briefs."""
+"""SQLite connection and schema. Tables: messages (idempotency/undo), llm_spend, briefs,
+reminders_fired."""
 
 from __future__ import annotations
 
@@ -21,6 +22,16 @@ CREATE TABLE IF NOT EXISTS messages (
 CREATE TABLE IF NOT EXISTS briefs (
     day        TEXT PRIMARY KEY,
     created_at TEXT NOT NULL
+);
+
+-- One row per reminder CLAIMED for sending, not per one delivered: the claim is never
+-- released, so a failed send leaves the row behind on purpose (plan.md 5b). Same trick
+-- as `briefs` otherwise: the key is the lock,
+-- so a restart, an overlapping poll or a replayed misfire cannot notify twice.
+-- Key shapes live in models.claim_reminder.
+CREATE TABLE IF NOT EXISTS reminders_fired (
+    key      TEXT PRIMARY KEY,
+    fired_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS llm_spend (

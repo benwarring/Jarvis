@@ -105,6 +105,76 @@ def test_the_llm_keys_are_typed_and_present(fake_env):
     assert isinstance(cfg.llm_daily_spend_limit_usd, float), "a string compares wrong against spend"
 
 
+# --- reminders: optional keys, because this phase shipped after the .env ------
+
+
+def test_the_reminder_keys_are_optional_and_default_to_the_shipped_numbers(monkeypatch):
+    """A .env written before Phase 7 must still boot, with plan.md's numbers."""
+    monkeypatch.delenv("REMINDER_LEAD_MINUTES", raising=False)
+    monkeypatch.delenv("REMINDER_POLL_MINUTES", raising=False)
+    get_config.cache_clear()
+
+    cfg = get_config()
+
+    assert (cfg.reminder_lead_minutes, cfg.reminder_poll_minutes) == (30, 15)
+
+
+def test_the_reminder_keys_are_read_when_they_are_there(monkeypatch):
+    monkeypatch.setenv("REMINDER_LEAD_MINUTES", "45")
+    monkeypatch.setenv("REMINDER_POLL_MINUTES", "5")
+    get_config.cache_clear()
+
+    cfg = get_config()
+
+    assert (cfg.reminder_lead_minutes, cfg.reminder_poll_minutes) == (45, 5)
+
+
+@pytest.mark.parametrize("key", ["REMINDER_LEAD_MINUTES", "REMINDER_POLL_MINUTES"])
+@pytest.mark.parametrize("value", ["half an hour", "15.5", "", " "])
+def test_a_present_but_unparseable_reminder_key_fails_loudly(monkeypatch, key, value):
+    """Absent means the default; a typo must not quietly become one."""
+    monkeypatch.setenv(key, value)
+    get_config.cache_clear()
+
+    if not value.strip():  # blank is absent, not a typo
+        cfg = get_config()
+        assert (cfg.reminder_lead_minutes, cfg.reminder_poll_minutes) == (30, 15)
+        return
+
+    with pytest.raises(SystemExit) as exc:
+        get_config()
+
+    assert key in str(exc.value)
+    assert value not in str(exc.value), "a bad value must not be echoed back"
+
+
+@pytest.mark.parametrize("key", ["REMINDER_LEAD_MINUTES", "REMINDER_POLL_MINUTES"])
+@pytest.mark.parametrize("value", ["0", "-5"])
+def test_a_reminder_interval_of_zero_or_less_is_rejected(monkeypatch, key, value):
+    """Zero would mean "remind me never" for the lead and a hot loop for the poll."""
+    monkeypatch.setenv(key, value)
+    get_config.cache_clear()
+
+    with pytest.raises(SystemExit) as exc:
+        get_config()
+
+    assert key in str(exc.value)
+
+
+def test_every_bad_key_is_named_in_the_one_startup_failure(monkeypatch):
+    """One SystemExit listing everything, not one restart per typo."""
+    monkeypatch.setenv("REMINDER_LEAD_MINUTES", "soon")
+    monkeypatch.setenv("REMINDER_POLL_MINUTES", "0")
+    monkeypatch.setenv("DISCORD_GUILD_ID", "seventeen")
+    get_config.cache_clear()
+
+    with pytest.raises(SystemExit) as exc:
+        get_config()
+
+    message = str(exc.value)
+    for key in ("REMINDER_LEAD_MINUTES", "REMINDER_POLL_MINUTES", "DISCORD_GUILD_ID"):
+        assert key in message
+
 # --- test isolation: the suite must never see the real .env -----------------
 
 

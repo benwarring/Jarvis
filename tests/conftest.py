@@ -100,3 +100,76 @@ def fake_config(monkeypatch, tmp_path):
 def fake_env() -> dict[str, str]:
     """The values the autouse fixture injected, for tests that assert on them."""
     return dict(FAKE_ENV)
+
+
+# --- the scheduled jobs: one bot double and one scheduler capture, shared by the
+# --- brief tests and the reminder tests, because both drive `Jarvis.scheduler.jobs`.
+
+
+class FakeChannel:
+    def __init__(self, raises: Exception | None = None) -> None:
+        self.sent: list[str] = []
+        self.raises = raises
+
+    async def send(self, content: str) -> None:
+        if self.raises is not None:
+            raise self.raises
+        self.sent.append(content)
+
+
+class FakeBot:
+    """Only what the jobs touch: wait_until_ready, get_channel, fetch_channel."""
+
+    def __init__(self, *, cached: bool = True, raises: Exception | None = None) -> None:
+        self.channel = FakeChannel(raises)
+        self.cached = cached
+        self.asked: list[int] = []
+        self.fetched: list[int] = []
+        self.sent_before_ready: int | None = None
+
+    async def wait_until_ready(self) -> None:
+        # Recorded, not just counted: posting into a client that is still connecting is
+        # a message lost, so the ordering is the thing worth asserting.
+        self.sent_before_ready = len(self.channel.sent)
+
+    def get_channel(self, channel_id: int):
+        self.asked.append(channel_id)
+        return self.channel if self.cached else None
+
+    async def fetch_channel(self, channel_id: int):
+        self.fetched.append(channel_id)
+        return self.channel
+
+    @property
+    def sent(self) -> list[str]:
+        return self.channel.sent
+
+
+@pytest.fixture
+def scheduler(monkeypatch) -> dict:
+    """Capture what would have been handed to APScheduler. Nothing is really scheduled."""
+    from Jarvis.scheduler import jobs
+
+    made: dict = {}
+
+    class FakeScheduler:
+        def __init__(self, **kwargs):
+            made["scheduler"] = kwargs
+            made["instance"] = self
+            self.started = False
+            self.shutdown_wait = "never called"
+
+        def add_job(self, func, trigger, **kwargs):
+            # Keyed by job id, because `start` registers more than one job and a single
+            # slot would silently hand every test whichever job was added last.
+            made.setdefault("jobs", {})[kwargs["id"]] = dict(kwargs, func=func, trigger=trigger)
+
+        def start(self):
+            self.started = True
+
+        def shutdown(self, wait=True):
+            self.shutdown_wait = wait
+
+    monkeypatch.setattr(jobs, "AsyncIOScheduler", FakeScheduler)
+    monkeypatch.setattr(jobs, "CronTrigger", lambda **kwargs: made.setdefault("cron", kwargs))
+    return made

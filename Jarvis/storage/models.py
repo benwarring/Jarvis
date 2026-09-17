@@ -99,6 +99,37 @@ def brief_posted(day: str) -> bool:
     return connect().execute("SELECT 1 FROM briefs WHERE day = ?", (day,)).fetchone() is not None
 
 
+# --- reminders (plan.md section 5b) -----------------------------------------
+
+
+def claim_reminder(key: str) -> bool:
+    """Claim one reminder by key. True if THIS call claimed it; see `record_brief`.
+
+    One INSERT, so two overlapping polls cannot both win. The key IS the design:
+
+      appt:<event_id>              one ping per event, ever
+      task:<page_id>:<YYYY-MM-DD>  one nudge per task per local day
+      sweep:<YYYY-MM-DD>           one end-of-day sweep per local day
+
+    ponytail: an event moved to a later time keeps its Google id, so it has already
+    been claimed and will not ping again. Put the start time in the key if
+    re-pinging a moved event ever matters - it costs a duplicate ping per reschedule.
+
+    There is no release_reminder on purpose. `release_brief` exists because there is
+    exactly one brief a day and losing it is the failure Phase 6 exists to prevent; a
+    reminder is one of many and time-sensitive, so a duplicate ping is worse than a
+    missed one. A failed send is logged, not retried.
+    """
+    conn = connect()
+    with conn:
+        cur = conn.execute(
+            "INSERT INTO reminders_fired (key, fired_at) VALUES (?, ?) "
+            "ON CONFLICT(key) DO NOTHING",
+            (key, datetime.now(timezone.utc).isoformat()),
+        )
+    return cur.rowcount == 1
+
+
 if __name__ == "__main__":  # smallest check that fails if spend REPLACES instead of ACCUMULATES
     import sqlite3 as _sqlite3
 
@@ -125,4 +156,12 @@ if __name__ == "__main__":  # smallest check that fails if spend REPLACES instea
     assert brief_posted("2026-09-11") is True
     assert record_brief("2026-09-12") is True, "a different day is a different claim"
     assert _mem.execute("SELECT COUNT(*) c FROM briefs").fetchone()["c"] == 2
+
+    # The reminder claim: the same trick, keyed by reminder rather than by day.
+    assert claim_reminder("appt:abc123") is True, "first claim must win"
+    assert claim_reminder("appt:abc123") is False, "a second poll must lose, not raise"
+    assert claim_reminder("task:page9:2026-09-11") is True
+    assert claim_reminder("task:page9:2026-09-12") is True, "next day is a new nudge"
+    assert claim_reminder("sweep:2026-09-11") is True
+    assert _mem.execute("SELECT COUNT(*) c FROM reminders_fired").fetchone()["c"] == 4
     print("spend accounting ok")

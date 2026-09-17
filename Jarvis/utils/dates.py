@@ -53,9 +53,14 @@ def to_local(dt: datetime) -> datetime:
     return dt.astimezone(_tz())
 
 
+def clock(dt: datetime) -> str:
+    """One time of day, rendered local. The only place the clock format is written."""
+    return f"{to_local(dt):%I:%M%p}"
+
+
 def format_span(start: datetime, end: datetime) -> str:
     """A start-to-end time span, rendered local. Stored UTC, shown in the user's zone."""
-    return f"{to_local(start):%I:%M%p}-{to_local(end):%I:%M%p}"
+    return f"{clock(start)}-{clock(end)}"
 
 
 def day_bounds(day: date) -> tuple[datetime, datetime]:

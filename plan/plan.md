@@ -245,15 +245,26 @@ The same code path serves `/brief` on demand.
 ### 5b. Reminders
 
 Distinct from the brief: the brief is one 07:00 summary, reminders are nudges
-through the day. A poll every 15 minutes, entirely deterministic:
+through the day. A poll every `REMINDER_POLL_MINUTES` (default 15), entirely
+deterministic:
 
-- **Appointments** — DM or `#inbox` ping at a configurable lead time (default 30
-  minutes) before a calendar event starts.
+- **Appointments** — an `#inbox` ping at `REMINDER_LEAD_MINUTES` (default 30) before a
+  calendar event starts. Only for an event that is *still ahead of you*: one already
+  under way, or already over, is never pinged, so a late poll or a restart mid-meeting
+  stays quiet. An all-day event has no start to be early for and never pings.
 - **Tasks** — a nudge for anything due today still marked `Not started` as its due
-  time approaches, plus a single end-of-day sweep for what slipped.
+  time approaches, plus a single end-of-day sweep for what slipped. The sweep says
+  nothing at all when nothing is outstanding.
 
-Every fired reminder is recorded in SQLite so a restart cannot double-notify. No
-LLM call — the trigger is a timestamp comparison and the message is a template.
+Every reminder is *claimed* in SQLite before it is sent, so two overlapping polls or a
+restart cannot double-notify. The claim is deliberately never released: unlike the
+brief, which releases its day and retries because losing it is that phase's whole
+failure mode, a reminder is one of many and pinned to a moment — a duplicate ping is
+worse than a missed one, so a failed send is logged and dropped.
+
+No LLM call anywhere in this path — the trigger is a timestamp comparison and the
+message is a template. It runs every quarter hour forever, which makes it the easiest
+place in the project to acquire a recurring bill by accident.
 
 ---
 
@@ -306,10 +317,31 @@ Category is auto-assigned by the fast-path from a static keyword map
 |---|---|
 | `messages` | Discord message ID -> resolved intent -> resulting Notion/GCal ID. Powers idempotency. **Not yet sufficient for undo:** the Discord message id is the primary key, so a confirmed multi-write batch (Layer 2 can propose one) overwrites its own row and only the last write survives. Phase 8 needs a row per write before ❌-undo can be honest |
 | `briefs` | One row per generated brief; prevents double-posting after a restart |
-| `reminders_fired` | One row per delivered reminder; prevents double-notifying after a restart |
+| `reminders_fired` | One row per reminder *claimed for sending*, not per delivered one — a failed send leaves the row, by design (§5b) |
 | `conversations` | Rolling short-term context for Layer 2 multi-turn. **Not built** — Layer 2 is single-turn, and a rolling context multiplies both tokens and prompt-injection surface for no demonstrated need |
 | `llm_spend` | One row per local day: tokens and USD. Backs the §11 spend guard |
 | `cache` | Notion database schema cache, so properties aren't re-fetched every call |
+
+**One connection, shared across threads — a known hazard, to be fixed in Phase 8.**
+`db.connect()` is a single `@lru_cache`d connection with `check_same_thread=False`.
+Concurrent *statements* are safe (SQLite is built serialized here, and every claim is a
+single atomic `INSERT ... ON CONFLICT`), and that is pinned by a test: eight threads
+released on a barrier produce exactly one winner.
+
+The transaction is the soft spot. `with conn:` commits or rolls back the **whole shared
+connection**, so a thread that has already been told `rowcount == 1` can lose its row to
+a *different* thread's write failing inside its own `with conn:`. The consequence is a
+reminder delivered twice, or a spend row lost — which under-counts against
+`LLM_DAILY_SPEND_LIMIT_USD` and so weakens the cost guard rather than strengthening it.
+
+It has been reproduced deliberately, but it needs a concurrently *failing* write, and
+every writer here is upsert-shaped (`OR REPLACE` / `ON CONFLICT DO NOTHING` /
+`DO UPDATE`) and cannot raise `IntegrityError` on its own — so today it takes something
+exogenous: a disk error, a lock timeout, an interrupt mid-shutdown. It predates Phase 7;
+Phase 7 is what turned concurrent writers from theoretical into routine, by running the
+poll in a worker thread alongside the brief job and the Discord handlers.
+
+Fix in Phase 8: a connection per thread (`threading.local`), or one lock around writes.
 
 ---
 
@@ -451,7 +483,7 @@ Each phase also ends with a §9 review pass.
 | **5** | LLM fallback | Layer 2 tool-use loop. Resolve §10 first |
 | **6** | Daily brief | Task Scheduler posts to `#daily-brief` at 07:00; `/brief` on demand |
 | **7** | Reminders | Appointment lead-time pings and task nudges, idempotent across restart |
-| **8** | Hardening | Retries with backoff, rate-limit handling, errors to `#logs`, undo via ❌ (needs the `messages` rework in §6 first — one row per write, not per Discord message), spend guard (already built in Phase 5) |
+| **8** | Hardening | Retries with backoff, rate-limit handling, errors to `#logs`, undo via ❌ (needs the `messages` rework in §6 first — one row per write, not per Discord message), the shared-connection fix in §6, and the §8 functional suite. The spend guard already shipped in Phase 5 |
 | **9** | Portability | Dockerfile + documented VPS deploy, so the laptop stops being load-bearing |
 | **10** | Control hub (GUI) | A single screen for Jarvis: today's schedule, open tasks, the grocery list, recent activity, and what Layer 2 has cost this month. See §15 |
 
