@@ -186,8 +186,7 @@ non-goal in plan §13. The phases after it were renumbered, so anything remember
 
 Also open, from plan §14: the appointment lead time (30 min, placeholder), whether the
 brief should footer tomorrow's first commitment, and three cosmetic ambiguities in
-`plan/jarvis-creation-flow.drawio` — which still shows a **Weather update** node that no
-longer matches §2.
+`plan/jarvis-creation-flow.drawio`.
 
 ---
 

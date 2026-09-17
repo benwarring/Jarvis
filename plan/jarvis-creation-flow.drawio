@@ -25,9 +25,6 @@
         <mxCell id="PAwQHiGKTAKS_q8dQoWC-5" parent="1" style="ellipse;whiteSpace=wrap;html=1;shapeInside=1;rounded=1;curved=0;" value="Tools" vertex="1">
           <mxGeometry height="80" width="120" x="370" y="420" as="geometry" />
         </mxCell>
-        <mxCell id="PAwQHiGKTAKS_q8dQoWC-15" edge="1" parent="1" source="PAwQHiGKTAKS_q8dQoWC-6" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;curved=0;" target="PAwQHiGKTAKS_q8dQoWC-11">
-          <mxGeometry relative="1" as="geometry" />
-        </mxCell>
         <mxCell id="PAwQHiGKTAKS_q8dQoWC-20" edge="1" parent="1" source="PAwQHiGKTAKS_q8dQoWC-6" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=0;exitY=0.5;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;curved=0;" target="PAwQHiGKTAKS_q8dQoWC-16">
           <mxGeometry relative="1" as="geometry" />
         </mxCell>
@@ -42,9 +39,6 @@
         </mxCell>
         <mxCell id="PAwQHiGKTAKS_q8dQoWC-7" parent="1" style="ellipse;whiteSpace=wrap;html=1;shapeInside=1;rounded=1;curved=0;" value="Reviewers" vertex="1">
           <mxGeometry height="80" width="120" x="1460" y="420" as="geometry" />
-        </mxCell>
-        <mxCell id="PAwQHiGKTAKS_q8dQoWC-11" parent="1" style="ellipse;whiteSpace=wrap;html=1;shapeInside=1;rounded=1;curved=0;" value="Weather update" vertex="1">
-          <mxGeometry height="80" width="120" x="740" y="670" as="geometry" />
         </mxCell>
         <mxCell id="PAwQHiGKTAKS_q8dQoWC-24" edge="1" parent="1" source="PAwQHiGKTAKS_q8dQoWC-16" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;curved=0;" target="PAwQHiGKTAKS_q8dQoWC-23" value="">
           <mxGeometry relative="1" as="geometry" />
